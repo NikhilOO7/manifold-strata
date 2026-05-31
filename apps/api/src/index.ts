@@ -6,6 +6,7 @@ import { serve } from '@hono/node-server';
 import { papersRouter } from './routes/papers';
 import { graphRouter } from './routes/graph';
 import { ingestRouter } from './routes/ingest';
+import { fieldRouter } from './routes/field';
 import { checkOllamaConnection, warmupModel } from './services/ollama';
 
 const app = new Hono();
@@ -30,7 +31,8 @@ app.get('/health', async (c) => {
 
 app.get('/', (c) => {
   return c.json({
-    name: 'Gaussian Splatting Knowledge Graph API',
+    name: 'Manifold API',
+    description: 'A geometric, low-LLM knowledge field over research papers',
     version: '1.0.0',
     endpoints: {
       health: 'GET /health',
@@ -59,6 +61,15 @@ app.get('/', (c) => {
         bulk: 'POST /api/ingest/bulk',
         status: 'GET /api/ingest/status/:jobId',
         seed: 'GET /api/ingest/seed/gaussian-splatting',
+      },
+      field: {
+        query: 'POST /api/field/query',
+        retrieve: 'GET /api/field/retrieve?q=X',
+        hierarchy: 'GET /api/field/hierarchy/:nodeId',
+        backfill: 'POST /api/field/backfill',
+        trainHyperbolic: 'POST /api/field/train-hyperbolic',
+        communities: 'POST /api/field/communities/build',
+        benchmark: 'GET /api/field/benchmark',
       }
     }
   });
@@ -67,6 +78,7 @@ app.get('/', (c) => {
 app.route('/api/papers', papersRouter);
 app.route('/api/graph', graphRouter);
 app.route('/api/ingest', ingestRouter);
+app.route('/api/field', fieldRouter);
 
 app.notFound((c) => {
   return c.json({ error: 'Not found', path: c.req.path }, 404);
@@ -81,7 +93,7 @@ const port = parseInt(process.env.PORT || '3000');
 
 async function startServer() {
   console.log('\n========================================');
-  console.log('  Gaussian Splatting Knowledge Graph');
+  console.log('  Manifold — Geometric Knowledge Field');
   console.log('========================================\n');
 
   console.log('Checking services...');

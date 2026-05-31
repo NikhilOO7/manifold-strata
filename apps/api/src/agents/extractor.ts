@@ -44,7 +44,9 @@ export async function extractEntitiesAndRelationships(
       EXTRACTION_SYSTEM_PROMPT,
       userPrompt,
       null,
-      0.3
+      0.3,
+      2,
+      'extractor'
     );
 
     return {

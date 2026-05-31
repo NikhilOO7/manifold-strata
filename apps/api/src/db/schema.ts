@@ -113,6 +113,49 @@ export const sources = pgTable('sources', {
   paperIdIdx: index('sources_paper_id_idx').on(table.paperId),
 }));
 
+// --- Manifold: geometric knowledge field ---------------------------------
+
+// One vector record per graph node: the Euclidean embedding used for
+// resolution / PPR seeding / compression, plus the trained Poincaré (hyperbolic)
+// coordinates used for hierarchy-aware queries. Stored as jsonb (number[]);
+// cosine similarity is computed in JS. pgvector is the scale path.
+export const nodeVectors = pgTable('node_vectors', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  nodeId: uuid('node_id').notNull().unique().references(() => nodes.id, { onDelete: 'cascade' }),
+  embedding: jsonb('embedding').notNull(),       // number[]
+  hyperbolic: jsonb('hyperbolic'),               // number[] | null (Poincaré ball coords)
+  model: text('model'),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+}, (table) => ({
+  nodeIdIdx: index('node_vectors_node_id_idx').on(table.nodeId),
+}));
+
+// Atomic factual propositions (sentence-split relationship evidence) with their
+// own embedding. These are the unit of compressed retrieval — far smaller than
+// the 2000-char chunks the legacy pipeline re-stuffs into prompts.
+export const propositions = pgTable('propositions', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  paperId: uuid('paper_id').references(() => papers.id, { onDelete: 'cascade' }),
+  text: text('text').notNull(),
+  embedding: jsonb('embedding'),                 // number[] | null
+  nodeIds: jsonb('node_ids'),                    // string[] (uuids this proposition mentions)
+  section: text('section'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+}, (table) => ({
+  paperIdIdx: index('propositions_paper_id_idx').on(table.paperId),
+}));
+
+// Cached GraphRAG-style community summaries: one LLM summary per cluster,
+// reused across all future queries so broad questions read 1 summary instead of N.
+export const communities = pgTable('communities', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  label: text('label'),
+  nodeIds: jsonb('node_ids'),                    // string[] (uuids)
+  summary: text('summary'),
+  embedding: jsonb('embedding'),                 // number[] | null
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
 export const papersRelations = relations(papers, ({ many }) => ({
   authors: many(paperAuthors),
   nodes: many(nodes),

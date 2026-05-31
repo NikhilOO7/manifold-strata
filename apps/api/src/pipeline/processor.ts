@@ -1,10 +1,16 @@
 import { db } from '../db';
-import { papers, nodes, edges, sources } from '../db/schema';
-import { eq, ilike } from 'drizzle-orm';
+import { papers, nodes, edges, sources, nodeVectors, propositions } from '../db/schema';
+import { eq, ilike, inArray } from 'drizzle-orm';
 import { extractEntitiesAndRelationships } from '../agents/extractor';
 import { resolveEntities } from '../agents/resolver';
 import { validateRelationships } from '../agents/validator';
+import { resolveEntitiesEmbed } from '../knowledge-field/resolve-embed';
+import { validateRelationshipsRules } from '../knowledge-field/validate-rules';
+import { embed, embedModel } from '../services/embeddings';
+import * as metrics from '../services/metrics';
 import { chunkText, detectSection } from '../services/pdf';
+
+type PipelineMode = 'field' | 'legacy';
 
 interface ProcessingStats {
   chunksProcessed: number;
@@ -23,6 +29,9 @@ export async function processPaper(paperId: string): Promise<ProcessingStats> {
     relationshipsRejected: 0,
   };
 
+  const mode: PipelineMode = process.env.PIPELINE_MODE === 'legacy' ? 'legacy' : 'field';
+  metrics.setMode(mode);
+
   try {
     const [paper] = await db
       .select()
@@ -38,11 +47,26 @@ export async function processPaper(paperId: string): Promise<ProcessingStats> {
       throw new Error(`Paper has no raw text: ${paperId}`);
     }
 
+    console.log(`Pipeline mode: ${mode}`);
+
     console.log(`\n${'='.repeat(60)}`);
     console.log(`Processing paper: ${paper.title}`);
     console.log(`${'='.repeat(60)}\n`);
 
     const paperNode = await getOrCreatePaperNode(paper);
+
+    // In field mode, give the paper node an embedding so it can seed retrieval.
+    if (mode === 'field') {
+      try {
+        const [pv] = await embed([`${paper.title}. ${paper.abstract || ''}`.trim()], 'node');
+        await db
+          .insert(nodeVectors)
+          .values({ nodeId: paperNode, embedding: pv, model: embedModel() })
+          .onConflictDoNothing();
+      } catch (e) {
+        console.warn('Failed to embed paper node:', e);
+      }
+    }
 
     const chunks = chunkText(paper.rawText, 2000, 200);
     console.log(`Split into ${chunks.length} chunks`);
@@ -93,7 +117,29 @@ export async function processPaper(paperId: string): Promise<ProcessingStats> {
           .from(nodes)
           .limit(500);
 
-        const resolverOutput = await resolveEntities(extractorOutput, existingNodes);
+        // Resolve entities: embedding-based (field) or LLM (legacy).
+        let resolverOutput;
+        let vectorsByName = new Map<string, number[]>();
+        if (mode === 'field') {
+          const existingIds = existingNodes.map((n) => n.id);
+          const nodeVectorMap = new Map<string, number[]>();
+          if (existingIds.length > 0) {
+            const vecRows = await db
+              .select()
+              .from(nodeVectors)
+              .where(inArray(nodeVectors.nodeId, existingIds));
+            for (const v of vecRows) nodeVectorMap.set(v.nodeId, v.embedding as number[]);
+          }
+          const fieldOut = await resolveEntitiesEmbed(
+            extractorOutput,
+            existingNodes as any,
+            nodeVectorMap
+          );
+          resolverOutput = fieldOut;
+          vectorsByName = fieldOut.vectorsByName;
+        } else {
+          resolverOutput = await resolveEntities(extractorOutput, existingNodes);
+        }
         console.log(`Resolved ${resolverOutput.resolvedEntities.length} entities`);
         if (resolverOutput.resolvedRelationships.length > 0) {
           console.log(`Resolved ${resolverOutput.resolvedRelationships.length} relationships:`);
@@ -131,6 +177,17 @@ export async function processPaper(paperId: string): Promise<ProcessingStats> {
               entity.canonicalId = newNode.id;
               stats.entitiesCreated++;
               console.log(`Created new ${nodeType}: ${entity.canonicalName}`);
+
+              // Persist the node embedding (reused from resolution — no extra call).
+              if (mode === 'field') {
+                const vec = vectorsByName.get(entity.canonicalName.toLowerCase());
+                if (vec) {
+                  await db
+                    .insert(nodeVectors)
+                    .values({ nodeId: newNode.id, embedding: vec, model: embedModel() })
+                    .onConflictDoNothing();
+                }
+              }
             }
           } else if (entity.canonicalId) {
             entityMap.set(entity.canonicalName.toLowerCase(), entity.canonicalId);
@@ -142,10 +199,18 @@ export async function processPaper(paperId: string): Promise<ProcessingStats> {
           paperDate: paper.publicationDate,
         };
 
-        const validationOutput = await validateRelationships(resolverOutput, graphContext);
+        const validationOutput = mode === 'field'
+          ? validateRelationshipsRules(resolverOutput, {
+              nodes: existingNodes as any,
+              paperDate: paper.publicationDate,
+            })
+          : await validateRelationships(resolverOutput, graphContext);
         console.log(`Validated: ${validationOutput.accepted.length} accepted, ${validationOutput.rejected.length} rejected`);
 
         stats.relationshipsRejected += validationOutput.rejected.length;
+
+        // Accumulate propositions (field mode): one atomic fact per accepted edge.
+        const propsToWrite: Array<{ text: string; nodeIds: string[] }> = [];
 
         for (const relationship of validationOutput.accepted) {
           try {
@@ -187,8 +252,33 @@ export async function processPaper(paperId: string): Promise<ProcessingStats> {
             });
 
             stats.relationshipsCreated++;
+
+            if (mode === 'field' && relationship.evidence) {
+              propsToWrite.push({
+                text: relationship.evidence.slice(0, 500),
+                nodeIds: [sourceId, targetId],
+              });
+            }
           } catch (relError) {
             console.error(`Error creating relationship:`, relError);
+          }
+        }
+
+        // Persist propositions for this chunk in one batched embed call.
+        if (mode === 'field' && propsToWrite.length > 0) {
+          try {
+            const embs = await embed(propsToWrite.map((p) => p.text), 'proposition');
+            await db.insert(propositions).values(
+              propsToWrite.map((p, idx) => ({
+                paperId,
+                text: p.text,
+                embedding: embs[idx],
+                nodeIds: p.nodeIds,
+                section,
+              }))
+            );
+          } catch (propError) {
+            console.error('Error writing propositions:', propError);
           }
         }
 

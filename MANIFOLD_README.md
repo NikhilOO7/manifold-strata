@@ -1,10 +1,6 @@
-# Manifold
+# Manifold (formerly "Gaussian Splatting Knowledge Graph")
 
-**A geometric, low-LLM knowledge field over research papers.**
-
-Manifold ingests academic papers and builds a queryable knowledge graph, but stores and retrieves that knowledge as a *geometric field* rather than leaning on the LLM at every step. Entity resolution and relationship validation run in embedding/rule space (not LLM calls), retrieval uses HippoRAG-style Personalized PageRank over the graph, concepts are embedded in hyperbolic (Poincaré) space for hierarchy-aware queries, and context is compressed via propositions + MMR before a single answer call. The seed corpus is the 3D Gaussian Splatting literature.
-
-See the `/api/field/*` endpoints for the geometric layer; set `PIPELINE_MODE=field|legacy` to A/B the LLM-call savings via `GET /api/field/benchmark`.
+A full-stack knowledge application that extracts structured relationships from academic papers (seeded on the 3D Gaussian Splatting literature) using AI agents, then stores and retrieves that knowledge as a geometric field — embedding-based resolution, HippoRAG-style PageRank retrieval, hyperbolic representation, and context compression. The system automatically reads papers, identifies entities (methods, concepts, datasets, metrics), and discovers semantic relationships between them to build a queryable knowledge graph.
 
 ## Architecture Overview
 

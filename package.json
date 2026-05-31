@@ -1,15 +1,15 @@
 {
-  "name": "gsplat-kg",
+  "name": "manifold",
   "private": true,
   "version": "1.0.0",
-  "description": "Knowledge graph application for Gaussian Splatting research papers",
+  "description": "Manifold — a geometric, low-LLM knowledge field over research papers",
   "scripts": {
     "dev": "pnpm --parallel --filter api --filter web dev",
     "build": "pnpm --filter api build && pnpm --filter web build",
     "db:push": "pnpm --filter api db:push",
     "db:studio": "pnpm --filter api db:studio"
   },
-  "keywords": ["knowledge-graph", "ai-agents", "gaussian-splatting"],
+  "keywords": ["knowledge-graph", "hyperbolic-embeddings", "hipporag", "retrieval", "ai-agents"],
   "author": "",
   "license": "MIT",
   "engines": {

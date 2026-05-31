@@ -1,6 +1,7 @@
 import { generateText } from 'ai';
 import { ollama } from 'ollama-ai-provider';
 import { openai } from '@ai-sdk/openai';
+import { recordLLM } from './metrics';
 
 const provider = process.env.LLM_PROVIDER || 'ollama'; // 'ollama' or 'openai'
 const baseURL = process.env.OLLAMA_BASE_URL || 'http://localhost:11434';
@@ -30,7 +31,8 @@ function getModel() {
 export async function generateCompletion(
   systemPrompt: string,
   userPrompt: string,
-  temperature: number = 0.7
+  temperature: number = 0.7,
+  operation: string = 'llm'
 ): Promise<OllamaResponse> {
   try {
     // Use OpenAI directly via fetch for reliability
@@ -60,14 +62,15 @@ export async function generateCompletion(
       const data: any = await response.json();
       const text = data.choices[0]?.message?.content || '';
 
-      return {
-        text,
-        usage: data.usage ? {
-          promptTokens: data.usage.prompt_tokens,
-          completionTokens: data.usage.completion_tokens,
-          totalTokens: data.usage.total_tokens,
-        } : undefined,
-      };
+      const usage = data.usage ? {
+        promptTokens: data.usage.prompt_tokens,
+        completionTokens: data.usage.completion_tokens,
+        totalTokens: data.usage.total_tokens,
+      } : undefined;
+
+      recordLLM(operation, usage);
+
+      return { text, usage };
     }
 
     // Fallback to AI SDK for Ollama
@@ -81,14 +84,15 @@ export async function generateCompletion(
       maxTokens: 16384,
     });
 
-    return {
-      text: result.text,
-      usage: result.usage ? {
-        promptTokens: result.usage.promptTokens,
-        completionTokens: result.usage.completionTokens,
-        totalTokens: result.usage.totalTokens,
-      } : undefined,
-    };
+    const usage = result.usage ? {
+      promptTokens: result.usage.promptTokens,
+      completionTokens: result.usage.completionTokens,
+      totalTokens: result.usage.totalTokens,
+    } : undefined;
+
+    recordLLM(operation, usage);
+
+    return { text: result.text, usage };
   } catch (error) {
     console.error('Error generating completion:', error);
 
@@ -105,7 +109,8 @@ export async function generateStructuredCompletion<T>(
   userPrompt: string,
   schema: any,
   temperature: number = 0.7,
-  retries: number = 2
+  retries: number = 2,
+  operation: string = 'llm'
 ): Promise<T> {
   let lastError: Error | null = null;
 
@@ -116,7 +121,7 @@ export async function generateStructuredCompletion<T>(
 CRITICAL: Your response must be ONLY valid JSON. No markdown, no explanations, no text before or after the JSON.
 Start your response with { and end with }. Do not use \`\`\`json or any other formatting.`;
 
-      const result = await generateCompletion(enhancedSystemPrompt, userPrompt, temperature);
+      const result = await generateCompletion(enhancedSystemPrompt, userPrompt, temperature, operation);
       
       const parsed = parseJSONResponse<T>(result.text);
       return parsed;

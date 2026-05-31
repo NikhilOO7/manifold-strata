@@ -27,7 +27,9 @@ export async function validateRelationships(
       VALIDATION_SYSTEM_PROMPT,
       userPrompt,
       null,
-      0.3
+      0.3,
+      2,
+      'validator'
     );
 
     return {
