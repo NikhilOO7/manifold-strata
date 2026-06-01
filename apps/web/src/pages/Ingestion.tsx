@@ -7,9 +7,15 @@ export default function Ingestion() {
   const [bulkIds, setBulkIds] = useState('');
   const [currentJobId, setCurrentJobId] = useState<string | null>(null);
   const [showSuccess, setShowSuccess] = useState(false);
+  const [selectedDomain, setSelectedDomain] = useState('default');
+
+  const { data: domainsData } = useQuery({
+    queryKey: ['domains'],
+    queryFn: () => api.domains.list(),
+  });
 
   const ingestMutation = useMutation({
-    mutationFn: (id: string) => api.ingest.arxiv(id),
+    mutationFn: (id: string) => api.ingest.arxiv(id, true, selectedDomain || undefined),
     onSuccess: (data) => {
       setCurrentJobId(data.jobId);
       setArxivId('');
@@ -66,6 +72,28 @@ export default function Ingestion() {
             <span>Import research papers from arXiv to build your knowledge graph</span>
           </p>
         </div>
+      </div>
+
+      {/* Domain selector — applies to both single and bulk ingestion */}
+      <div className="bg-white rounded-2xl border border-gray-200/60 p-5 shadow-sm flex flex-wrap items-center gap-4">
+        <label htmlFor="domain" className="text-sm font-semibold text-gray-700 whitespace-nowrap">
+          Domain
+        </label>
+        <select
+          id="domain"
+          value={selectedDomain}
+          onChange={(e) => setSelectedDomain(e.target.value)}
+          className="px-4 py-2.5 border-2 border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-gray-700 font-medium bg-white"
+        >
+          {(domainsData?.domains ?? []).map((d) => (
+            <option key={d.id} value={d.id}>
+              {d.name}
+            </option>
+          ))}
+        </select>
+        <p className="text-xs text-gray-500">
+          Papers are extracted and kept isolated within the selected domain.
+        </p>
       </div>
 
       {/* Success Toast */}

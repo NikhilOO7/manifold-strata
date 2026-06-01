@@ -1,14 +1,22 @@
-export type NodeType = 'paper' | 'method' | 'concept' | 'dataset' | 'metric';
+// Entity and relationship types are open (free-form strings). The extractor may
+// discover new ones and the DB stores them as text — these arrays are just the
+// well-known defaults used for UI seeding/coloring and prompt guidance, NOT an
+// enforced set.
+export const KNOWN_NODE_TYPES = ['paper', 'method', 'concept', 'dataset', 'metric'] as const;
 
-export type EdgeType =
-  | 'extends'
-  | 'improves'
-  | 'uses'
-  | 'introduces'
-  | 'cites'
-  | 'evaluates_on'
-  | 'compares_to'
-  | 'authored_by';
+export const KNOWN_EDGE_TYPES = [
+  'extends',
+  'improves',
+  'uses',
+  'introduces',
+  'cites',
+  'evaluates_on',
+  'compares_to',
+  'authored_by',
+] as const;
+
+export type NodeType = string;
+export type EdgeType = string;
 
 export type ProcessingStatus =
   | 'pending'

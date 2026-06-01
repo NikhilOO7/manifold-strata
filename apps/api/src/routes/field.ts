@@ -1,7 +1,9 @@
 import { Hono } from 'hono';
 import { db } from '../db';
 import { nodes, edges, nodeVectors, propositions } from '../db/schema';
-import { eq, inArray, isNull, isNotNull } from 'drizzle-orm';
+import { eq, inArray, isNull, isNotNull, and } from 'drizzle-orm';
+import { getDomain } from '../domains';
+import { domainWhere } from '../domains/filter';
 import { embed, embedOne, embedModel, cosine } from '../services/embeddings';
 import { retrieveField, fieldQuery } from '../knowledge-field/retrieve';
 import { trainPoincare, hierarchyNeighbors } from '../knowledge-field/hyperbolic';
@@ -9,8 +11,6 @@ import { buildCommunities } from '../knowledge-field/communities';
 import * as metrics from '../services/metrics';
 
 export const fieldRouter = new Hono();
-
-const HIERARCHICAL_EDGE_TYPES = ['extends', 'improves', 'cites'] as const;
 
 function chunk<T>(arr: T[], size: number): T[][] {
   const out: T[][] = [];
@@ -57,14 +57,18 @@ fieldRouter.post('/backfill', async (c) => {
 // --- Train hyperbolic (Poincaré) coordinates --------------------------------
 fieldRouter.post('/train-hyperbolic', async (c) => {
   try {
-    const allNodes = await db.select().from(nodes);
+    const body = await c.req.json().catch(() => ({}));
+    const domain = getDomain(body?.domain);
+    const hierTypes = domain.hierarchicalEdgeTypes ?? ['extends', 'improves', 'cites'];
+
+    const allNodes = await db.select().from(nodes).where(domainWhere(nodes.domain, domain.id));
     const hierEdges = await db
       .select({ sourceId: edges.sourceId, targetId: edges.targetId })
       .from(edges)
-      .where(inArray(edges.type, HIERARCHICAL_EDGE_TYPES as any));
+      .where(and(domainWhere(edges.domain, domain.id), inArray(edges.type, hierTypes as any)));
 
     if (hierEdges.length === 0) {
-      return c.json({ error: 'No hierarchical edges (extends/improves/cites) to train on' }, 400);
+      return c.json({ error: `No hierarchical edges (${hierTypes.join('/')}) to train on for domain "${domain.id}"` }, 400);
     }
 
     const coords = trainPoincare(
@@ -127,7 +131,8 @@ fieldRouter.get('/hierarchy/:nodeId', async (c) => {
 // --- Build community summaries ----------------------------------------------
 fieldRouter.post('/communities/build', async (c) => {
   try {
-    const result = await buildCommunities();
+    const body = await c.req.json().catch(() => ({}));
+    const result = await buildCommunities(body?.domain);
     return c.json(result);
   } catch (error) {
     console.error('Communities error:', error);
@@ -140,7 +145,8 @@ fieldRouter.get('/retrieve', async (c) => {
   try {
     const q = c.req.query('q');
     if (!q) return c.json({ error: 'q query param required' }, 400);
-    const result = await retrieveField(q);
+    const domain = c.req.query('domain') || undefined;
+    const result = await retrieveField(q, { domain });
     return c.json(result);
   } catch (error) {
     console.error('Retrieve error:', error);
@@ -155,7 +161,7 @@ fieldRouter.post('/query', async (c) => {
     const question = body.question;
     if (!question) return c.json({ error: 'question is required' }, 400);
 
-    const result = await fieldQuery(question, { verbalize: body.verbalize });
+    const result = await fieldQuery(question, { verbalize: body.verbalize, domain: body.domain });
     return c.json({
       question,
       answer: result.answer,

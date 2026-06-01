@@ -11,7 +11,9 @@
 
 import { db } from '../db';
 import { nodes, edges, nodeVectors, propositions } from '../db/schema';
-import { isNotNull } from 'drizzle-orm';
+import { isNotNull, and } from 'drizzle-orm';
+import { getDomain } from '../domains';
+import { domainWhere } from '../domains/filter';
 import { embedOne, cosine } from '../services/embeddings';
 import { generateCompletion } from '../services/ollama';
 import { personalizedPageRank, type GraphEdge } from './ppr';
@@ -35,6 +37,7 @@ export interface RetrieveOptions {
   topNodes?: number;    // how many PPR nodes to gather propositions from
   maxEvidence?: number; // MMR item cap
   maxChars?: number;    // MMR budget
+  domain?: string;      // scope retrieval to one domain (default: 'default' + legacy null)
 }
 
 export async function retrieveField(
@@ -46,16 +49,22 @@ export async function retrieveField(
   const maxEvidence = opts.maxEvidence ?? 10;
   const maxChars = opts.maxChars ?? 2000;
 
+  const domainId = getDomain(opts.domain).id;
   const qvec = await embedOne(question, 'query');
 
-  // Node metadata + vectors.
-  const allNodes = await db.select().from(nodes);
+  // Node metadata + vectors — scoped to the requested domain.
+  const allNodes = await db.select().from(nodes).where(domainWhere(nodes.domain, domainId));
   const nodeMeta = new Map<string, { name: string; type: string }>();
-  for (const n of allNodes) nodeMeta.set(n.id, { name: n.name, type: n.type });
+  const nodeIdSet = new Set<string>();
+  for (const n of allNodes) {
+    nodeMeta.set(n.id, { name: n.name, type: n.type });
+    nodeIdSet.add(n.id);
+  }
 
-  const vecRows = await db
-    .select({ nodeId: nodeVectors.nodeId, embedding: nodeVectors.embedding })
-    .from(nodeVectors);
+  // nodeVectors has no domain column; restrict to vectors of in-domain nodes.
+  const vecRows = (
+    await db.select({ nodeId: nodeVectors.nodeId, embedding: nodeVectors.embedding }).from(nodeVectors)
+  ).filter((v) => nodeIdSet.has(v.nodeId));
 
   // Seeds: nodes whose embedding is closest to the query.
   const seedScores = vecRows
@@ -66,10 +75,11 @@ export async function retrieveField(
   const seeds = new Map<string, number>();
   for (const s of seedScores) if (s.score > 0) seeds.set(s.id, s.score);
 
-  // Edges → PPR.
+  // Edges → PPR (same domain).
   const edgeRows = await db
     .select({ sourceId: edges.sourceId, targetId: edges.targetId, confidence: edges.confidence })
-    .from(edges);
+    .from(edges)
+    .where(domainWhere(edges.domain, domainId));
   const graphEdges: GraphEdge[] = edgeRows.map((e) => ({
     sourceId: e.sourceId,
     targetId: e.targetId,
@@ -98,7 +108,7 @@ export async function retrieveField(
   const propRows = await db
     .select()
     .from(propositions)
-    .where(isNotNull(propositions.embedding));
+    .where(and(isNotNull(propositions.embedding), domainWhere(propositions.domain, domainId)));
 
   const candidates = propRows
     .map((p) => {

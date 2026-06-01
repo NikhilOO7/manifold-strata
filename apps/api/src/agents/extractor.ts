@@ -1,16 +1,18 @@
 import { generateStructuredCompletion } from '../services/ollama';
-import { EXTRACTION_SYSTEM_PROMPT, createExtractionUserPrompt } from './prompts/extraction';
+import { createExtractionSystemPrompt, createExtractionUserPrompt } from './prompts/extraction';
+import { getDomain, type DomainConfig } from '../domains';
 
 export interface ExtractorInput {
   paperId: string;
   chunkIndex: number;
   text: string;
   section: string;
+  domain?: DomainConfig;
 }
 
 export interface EntityMention {
   mention: string;
-  type: 'method' | 'concept' | 'dataset' | 'metric' | 'paper_reference';
+  type: string; // open (free-form), scoped to the paper's domain
   spanStart: number;
   spanEnd: number;
   confidence: number;
@@ -33,15 +35,12 @@ export async function extractEntitiesAndRelationships(
   input: ExtractorInput
 ): Promise<ExtractorOutput> {
   try {
-    const userPrompt = createExtractionUserPrompt(
-      input.paperId,
-      input.chunkIndex,
-      input.text,
-      input.section
-    );
+    const domain = input.domain ?? getDomain();
+    const systemPrompt = createExtractionSystemPrompt(domain);
+    const userPrompt = createExtractionUserPrompt(input.text, input.section, domain.name);
 
     const result = await generateStructuredCompletion<ExtractorOutput>(
-      EXTRACTION_SYSTEM_PROMPT,
+      systemPrompt,
       userPrompt,
       null,
       0.3,

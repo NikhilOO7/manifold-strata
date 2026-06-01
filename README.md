@@ -213,6 +213,67 @@ Then open the **Graph Explorer** at http://localhost:5173/explorer — filter by
 - **Background worker + durable jobs** — ingestion/processing run on an in-process bounded-concurrency queue ([apps/api/src/queue](apps/api/src/queue/index.ts)); the request returns `202` immediately. Job status is persisted in a `jobs` table (survives restarts), and any job left mid-run by a crash is recovered to `failed` on startup so nothing hangs forever.
 - **Optional API-key auth** — set `API_KEY` to require a key (`Authorization: Bearer <key>` or `X-API-Key`) on write routes (`POST /api/ingest/*`, `POST /api/papers/*`, mutating `/api/field/*`). Unset for frictionless local dev.
 - **Rate limiting** — in-memory per-IP limits: ingest 10/min, field 30/min, graph & papers 200/min. Responses include `X-RateLimit-*` headers; `429` with `Retry-After` when exceeded.
+- **Open entity & relationship types** — node/edge `type` columns are free-form `text`, not enums. The extractor may discover new types (e.g. `task`, `model`, `loss`, `regularizes`) and they're stored without a migration; the rule validator treats unknown types gracefully (never hard-rejects), and the Explorer's type filter + colors are driven by `GET /api/graph/types` rather than a hardcoded list. `KNOWN_NODE_TYPES`/`KNOWN_EDGE_TYPES` in `packages/shared` are seed defaults only.
+
+## Domains (multi-field isolation)
+
+A single instance can host several research fields without their graphs bleeding into each other. A **domain** is code config ([apps/api/src/domains/](apps/api/src/domains/)) — a `DomainConfig` of preferred entity/relationship types, an extraction-prompt context, examples, and seed papers. Three ship by default: `default` (generic), `gaussian-splatting`, and `nlp`.
+
+How isolation works:
+- Papers are tagged with a `domain`; nodes, edges, and propositions are **stamped** with it.
+- Entity resolution only matches within the same domain, so `attention` (NLP) and `attention` (vision) stay separate nodes — **no cross-contamination**.
+- Retrieval (`/api/field/query`, MCP tools), graph views, and per-domain hyperbolic/community builds all scope by domain.
+- Types stay *open within* a domain (the extractor can still invent new ones); the domain just supplies the preferred set + prompt context.
+- Legacy data (created before domains) has a `NULL` domain and is treated as `default`, so nothing breaks. Adopt it into a domain with `POST /api/domains/backfill`.
+
+```bash
+# Ingest into a domain
+curl -X POST localhost:3000/api/ingest/arxiv \
+  -H 'Content-Type: application/json' \
+  -d '{"arxivId":"1706.03762","domain":"nlp","autoProcess":true}'
+
+# Seed a domain, query within it
+curl localhost:3000/api/ingest/seed/nlp
+curl -X POST localhost:3000/api/field/query \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"Which models extend the Transformer?","domain":"nlp"}'
+```
+
+Adding a domain is a new file in `apps/api/src/domains/` registered in `index.ts` — no schema migration. (Per-domain *type rules* and a DB-editable domain registry are natural next steps; see Limitations.)
+
+## Use it from an AI agent (MCP)
+
+Manifold ships an [MCP](https://modelcontextprotocol.io) server ([apps/api/src/mcp/server.ts](apps/api/src/mcp/server.ts)) that exposes the knowledge field as tools any MCP client (Claude Desktop, Claude Code, a larger agent) can call. The retrieval tools run entirely in vector/graph space — the *calling* agent does the reasoning, Manifold just returns compressed, grounded evidence.
+
+| Tool | LLM calls | Purpose |
+|---|---|---|
+| `search_knowledge(query, maxEvidence?)` | **0** | Embeddings + PPR + MMR → ranked, compressed evidence |
+| `find_entity(name, limit?)` | **0** | Resolve a name to node id(s)/types |
+| `get_subgraph(nodeId, depth?)` | **0** | N-hop neighborhood (nodes + typed edges) |
+| `query_field(question, verbalize?)` | 0 or 1 | Evidence, plus an answer if `verbalize: true` |
+
+Run it (stdio transport):
+
+```bash
+pnpm --filter api mcp
+```
+
+Register it with a client — e.g. Claude Desktop's `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "manifold": {
+      "command": "pnpm",
+      "args": ["--filter", "api", "mcp"],
+      "cwd": "/absolute/path/to/manifold-strata",
+      "env": { "DATABASE_URL": "postgresql://postgres:postgres@localhost:5433/knowledge_graph" }
+    }
+  }
+}
+```
+
+It reuses the same DB layer and field functions as the HTTP API — no duplicated logic, no network hop.
 
 ---
 
@@ -248,19 +309,27 @@ UUID primary keys; composite indexes on `(source_id, type)` and `(target_id, typ
 - `GET /api/graph/edges?type=&limit=&offset=` — list edges (single double-join query)
 - `GET /api/graph/subgraph?nodeId=&depth=` — N-hop neighborhood (depth capped at 3)
 - `GET /api/graph/stats` — aggregate counts
+- `GET /api/graph/types` — distinct node/edge types present in the graph (drives the UI's filters dynamically)
 - `GET /api/graph/queries/{improves-3dgs,extends-3dgs,datasets}` — example domain queries
 - `GET /api/graph/queries/method-relationships?name=` — relationships for a method
 - `GET /api/graph/queries/provenance/:edgeId` — source evidence for an edge
 
+All graph read endpoints accept an optional `?domain=` filter; omit it to span every domain.
+
 ### Ingestion
-- `POST /api/ingest/arxiv` — ingest one paper from arXiv *(auth)*
-- `POST /api/ingest/bulk` — ingest up to 100 papers *(auth)*
+- `POST /api/ingest/arxiv` — ingest one paper from arXiv (optional `domain` in body) *(auth)*
+- `POST /api/ingest/bulk` — ingest up to 100 papers (optional `domain`) *(auth)*
 - `GET /api/ingest/status/:jobId` — durable job status
-- `GET /api/ingest/seed/gaussian-splatting` — curated seed arXiv IDs
+- `GET /api/ingest/seed/:domain` — curated seed arXiv IDs for a domain
+
+### Domains
+- `GET /api/domains` — list registered domains
+- `GET /api/domains/:id` — full domain config (types, examples, seeds)
+- `POST /api/domains/backfill` — stamp legacy NULL-domain rows into a domain *(auth)*
 
 ### Field (geometric layer)
-- `POST /api/field/query` — embed → PPR → MMR → one verbalize call *(auth)*
-- `GET /api/field/retrieve?q=` — ranked evidence, **no** LLM call
+- `POST /api/field/query` — embed → PPR → MMR → one verbalize call (optional `domain`) *(auth)*
+- `GET /api/field/retrieve?q=&domain=` — ranked evidence, **no** LLM call
 - `GET /api/field/hierarchy/:nodeId` — generalizations / specializations (hyperbolic)
 - `POST /api/field/backfill` — embed existing nodes + propositions *(auth)*
 - `POST /api/field/train-hyperbolic` — train Poincaré coords on extends/improves/cites *(auth)*
@@ -292,7 +361,8 @@ manifold-strata/
 ├── apps/
 │   ├── api/                     # Hono backend
 │   │   └── src/
-│   │       ├── routes/          # graph, ingest, papers, field
+│   │       ├── routes/          # graph, ingest, papers, field, domains
+│   │       ├── domains/         # per-field ontology registry (config-as-code)
 │   │       ├── agents/          # legacy 3-agent pipeline + prompts/schemas
 │   │       ├── knowledge-field/ # resolve-embed, validate-rules, ppr,
 │   │       │                    #   compress, hyperbolic, communities, retrieve
@@ -300,6 +370,7 @@ manifold-strata/
 │   │       ├── pipeline/        # processor (field/legacy orchestration)
 │   │       ├── queue/           # durable jobs + background worker
 │   │       ├── middleware/      # auth, rate-limit
+│   │       ├── mcp/             # MCP server (stdio) over the field functions
 │   │       └── db/              # Drizzle schema + connection
 │   └── web/                     # React + Vite frontend
 │       └── src/
@@ -316,7 +387,7 @@ manifold-strata/
 - **Single-instance worker** — the background queue is in-process with a durable `jobs` table. Multi-instance/horizontal scale wants a shared queue (BullMQ + Redis); the job-table contract is designed so that swap is local to `apps/api/src/queue`.
 - **Status updates are polled** — the Dashboard/Ingestion pages poll every ~2s. Server-Sent Events would push updates and cut idle DB load.
 - **Vectors in JSONB** — cosine similarity is computed in JS, which is fine at this corpus size (hundreds–thousands of nodes). pgvector + an HNSW index is the path to larger graphs.
-- **Fixed entity/edge types** — node and edge types are Postgres enums. A domain-config layer (text types + per-domain prompts) would generalize ingestion to arbitrary fields without migrations.
+- **Domains are strictly isolated, with no cross-domain bridges** — each node lives in exactly one domain (see [Domains](#domains-multi-field-isolation)), so a concept studied in two fields becomes two nodes. A future "shared" namespace or a `domains text[]` tag could link them where it's genuinely the same entity. Domains are also config-as-code; a DB-editable registry + per-domain type-compatibility rules are natural extensions.
 - **Hyperbolic/community layers are batch** — `train-hyperbolic` and `communities/build` are run on demand, not incrementally maintained as papers arrive.
 - **Auth is a single shared key** — fine for a protected deployment; real multi-tenant use wants per-user keys / JWT and scoped permissions.
 

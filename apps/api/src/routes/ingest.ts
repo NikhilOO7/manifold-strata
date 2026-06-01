@@ -5,6 +5,7 @@ import { eq } from 'drizzle-orm';
 import { fetchAndExtractPDF } from '../services/pdf';
 import { processPaper } from '../pipeline/processor';
 import { paperQueue, createJob, setJobStatus, getJob } from '../queue';
+import { getDomain } from '../domains';
 
 export const ingestRouter = new Hono();
 
@@ -58,7 +59,7 @@ async function fetchArxivMetadata(arxivId: string): Promise<ArxivMetadata> {
 ingestRouter.post('/arxiv', async (c) => {
   try {
     const body = await c.req.json();
-    const { arxivId, autoProcess = false } = body;
+    const { arxivId, autoProcess = false, domain } = body;
 
     if (!arxivId) {
       return c.json({ error: 'arxivId is required' }, 400);
@@ -81,9 +82,9 @@ ingestRouter.post('/arxiv', async (c) => {
     }
 
     const jobId = `job-${Date.now()}-${Math.random().toString(36).substring(7)}`;
-    await createJob(jobId, 'ingest', { metadata: { arxivId: cleanId, autoProcess } });
+    await createJob(jobId, 'ingest', { metadata: { arxivId: cleanId, autoProcess, domain } });
 
-    paperQueue.enqueue(() => processArxivPaper(jobId, cleanId, autoProcess));
+    paperQueue.enqueue(() => processArxivPaper(jobId, cleanId, autoProcess, domain));
 
     return c.json({ jobId, status: 'queued' }, 202);
   } catch (error) {
@@ -92,7 +93,7 @@ ingestRouter.post('/arxiv', async (c) => {
   }
 });
 
-async function processArxivPaper(jobId: string, arxivId: string, autoProcess: boolean) {
+async function processArxivPaper(jobId: string, arxivId: string, autoProcess: boolean, domain?: string) {
   try {
     await setJobStatus(jobId, { status: 'fetching_metadata', progress: 'Fetching paper metadata from arXiv...' });
     
@@ -121,6 +122,7 @@ async function processArxivPaper(jobId: string, arxivId: string, autoProcess: bo
         pdfUrl: metadata.pdfUrl,
         publicationDate: metadata.published || null,
         rawText: rawText || null,
+        domain: domain || null,
         processed: false,
       })
       .returning();
@@ -205,7 +207,7 @@ ingestRouter.get('/status/:jobId', async (c) => {
 ingestRouter.post('/bulk', async (c) => {
   try {
     const body = await c.req.json();
-    const { arxivIds, autoProcess = false } = body;
+    const { arxivIds, autoProcess = false, domain } = body;
 
     if (!arxivIds || !Array.isArray(arxivIds) || arxivIds.length === 0) {
       return c.json({ error: 'arxivIds array is required' }, 400);
@@ -222,8 +224,8 @@ ingestRouter.post('/bulk', async (c) => {
       if (!cleanId) continue;
 
       const jobId = `job-${Date.now()}-${Math.random().toString(36).substring(7)}-${queued.length}`;
-      await createJob(jobId, 'ingest', { metadata: { arxivId: cleanId, autoProcess } });
-      paperQueue.enqueue(() => processArxivPaper(jobId, cleanId, autoProcess));
+      await createJob(jobId, 'ingest', { metadata: { arxivId: cleanId, autoProcess, domain } });
+      paperQueue.enqueue(() => processArxivPaper(jobId, cleanId, autoProcess, domain));
 
       queued.push({ arxivId: cleanId, jobId });
     }
@@ -238,43 +240,21 @@ ingestRouter.post('/bulk', async (c) => {
   }
 });
 
-ingestRouter.get('/seed/gaussian-splatting', async (c) => {
-  const seedPapers = [
-    '2308.04079',
-    '2308.14737',
-    '2309.16585',
-    '2310.08528',
-    '2311.12775',
-    '2311.16099',
-    '2311.17977',
-    '2312.00109',
-    '2312.02126',
-    '2312.03203',
-    '2312.07504',
-    '2312.13772',
-    '2401.01339',
-    '2401.02436',
-    '2402.00752',
-    '2402.03715',
-    '2402.10259',
-    '2403.02176',
-    '2403.11625',
-    '2403.17888',
-    '2404.00109',
-    '2404.01133',
-    '2404.07613',
-    '2405.00121',
-    '2405.12872',
-  ];
+// Generic seed endpoint — reads the curated arXiv ids from the domain registry.
+ingestRouter.get('/seed/:domain', async (c) => {
+  const domainId = c.req.param('domain');
+  const domain = getDomain(domainId);
+  const seedPapers = domain.seedPaperIds ?? [];
 
   return c.json({
-    message: 'Seed paper IDs for Gaussian Splatting domain',
-    description: 'POST these IDs to /api/ingest/bulk to ingest them',
+    domain: domain.id,
+    message: `Seed paper IDs for the "${domain.name}" domain`,
+    description: 'POST these IDs to /api/ingest/bulk (with the same domain) to ingest them',
     arxivIds: seedPapers,
     count: seedPapers.length,
     example: {
       endpoint: 'POST /api/ingest/bulk',
-      body: { arxivIds: seedPapers.slice(0, 5), autoProcess: true }
-    }
+      body: { arxivIds: seedPapers.slice(0, 5), autoProcess: true, domain: domain.id },
+    },
   });
 });

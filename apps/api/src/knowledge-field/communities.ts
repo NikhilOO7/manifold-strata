@@ -9,6 +9,8 @@
 
 import { db } from '../db';
 import { nodes, edges, communities, propositions } from '../db/schema';
+import { getDomain } from '../domains';
+import { domainWhere } from '../domains/filter';
 import { generateCompletion } from '../services/ollama';
 import { embedOne } from '../services/embeddings';
 
@@ -64,10 +66,14 @@ export interface BuildCommunitiesResult {
   summarized: number;
 }
 
-export async function buildCommunities(minSize = 3): Promise<BuildCommunitiesResult> {
-  const allNodes = await db.select().from(nodes);
+export async function buildCommunities(domainId?: string, minSize = 3): Promise<BuildCommunitiesResult> {
+  const domain = getDomain(domainId).id;
+  const allNodes = await db.select().from(nodes).where(domainWhere(nodes.domain, domain));
   const nameById = new Map(allNodes.map((n) => [n.id, n.name]));
-  const edgeRows = await db.select({ sourceId: edges.sourceId, targetId: edges.targetId }).from(edges);
+  const edgeRows = await db
+    .select({ sourceId: edges.sourceId, targetId: edges.targetId })
+    .from(edges)
+    .where(domainWhere(edges.domain, domain));
 
   const labels = labelPropagation(
     allNodes.map((n) => n.id),
@@ -81,10 +87,10 @@ export async function buildCommunities(minSize = 3): Promise<BuildCommunitiesRes
     groups.get(label)!.push(nodeId);
   }
 
-  // Replace previous communities.
-  await db.delete(communities);
+  // Replace previous communities for this domain only.
+  await db.delete(communities).where(domainWhere(communities.domain, domain));
 
-  const allProps = await db.select().from(propositions);
+  const allProps = await db.select().from(propositions).where(domainWhere(propositions.domain, domain));
 
   let communityCount = 0;
   let summarized = 0;
@@ -124,6 +130,7 @@ export async function buildCommunities(minSize = 3): Promise<BuildCommunitiesRes
 
     await db.insert(communities).values({
       label,
+      domain,
       nodeIds: members,
       summary,
       embedding: embedding as any,

@@ -41,12 +41,13 @@ export const api = {
   },
 
   graph: {
-    nodes: (params?: { type?: string; search?: string; limit?: number; offset?: number }) => {
+    nodes: (params?: { type?: string; search?: string; limit?: number; offset?: number; domain?: string }) => {
       const queryParams = new URLSearchParams();
       if (params?.type) queryParams.set('type', params.type);
       if (params?.search) queryParams.set('search', params.search);
       if (params?.limit) queryParams.set('limit', params.limit.toString());
       if (params?.offset) queryParams.set('offset', params.offset.toString());
+      if (params?.domain) queryParams.set('domain', params.domain);
 
       return fetchAPI<{ nodes: Node[]; pagination: { limit: number; offset: number } }>(
         `/api/graph/nodes?${queryParams}`
@@ -56,11 +57,12 @@ export const api = {
       fetchAPI<{ node: Node; outgoingEdges: Edge[]; incomingEdges: Edge[] }>(
         `/api/graph/nodes/${id}`
       ),
-    edges: (params?: { type?: string; limit?: number; offset?: number }) => {
+    edges: (params?: { type?: string; limit?: number; offset?: number; domain?: string }) => {
       const queryParams = new URLSearchParams();
       if (params?.type) queryParams.set('type', params.type);
       if (params?.limit) queryParams.set('limit', params.limit.toString());
       if (params?.offset) queryParams.set('offset', params.offset.toString());
+      if (params?.domain) queryParams.set('domain', params.domain);
 
       return fetchAPI<{ edges: Edge[]; pagination: { limit: number; offset: number } }>(
         `/api/graph/edges?${queryParams}`
@@ -68,14 +70,33 @@ export const api = {
     },
     subgraph: (nodeId: string, depth = 1) =>
       fetchAPI<Subgraph>(`/api/graph/subgraph?nodeId=${nodeId}&depth=${depth}`),
-    stats: () => fetchAPI<GraphStats>('/api/graph/stats'),
+    stats: (domain?: string) =>
+      fetchAPI<GraphStats>(`/api/graph/stats${domain ? `?domain=${domain}` : ''}`),
+    types: (domain?: string) =>
+      fetchAPI<{ nodeTypes: string[]; edgeTypes: string[] }>(
+        `/api/graph/types${domain ? `?domain=${domain}` : ''}`
+      ),
+  },
+
+  domains: {
+    list: () =>
+      fetchAPI<{
+        domains: Array<{
+          id: string;
+          name: string;
+          description: string;
+          entityTypes: string[];
+          relationshipTypes: string[];
+          seedCount: number;
+        }>;
+      }>('/api/domains'),
   },
 
   ingest: {
-    arxiv: (arxivId: string, autoProcess = true) =>
+    arxiv: (arxivId: string, autoProcess = true, domain?: string) =>
       fetchAPI<{ jobId: string; status: string }>('/api/ingest/arxiv', {
         method: 'POST',
-        body: JSON.stringify({ arxivId, autoProcess }),
+        body: JSON.stringify({ arxivId, autoProcess, domain }),
       }),
     status: (jobId: string) =>
       fetchAPI<{ status: string; paperId?: string; error?: string }>(

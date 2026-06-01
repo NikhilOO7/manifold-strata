@@ -1,18 +1,10 @@
 import { pgTable, uuid, text, timestamp, boolean, integer, decimal, jsonb, date, pgEnum, primaryKey, index } from 'drizzle-orm/pg-core';
 import { relations } from 'drizzle-orm';
 
-export const nodeTypeEnum = pgEnum('node_type', ['paper', 'method', 'concept', 'dataset', 'metric']);
-
-export const edgeTypeEnum = pgEnum('edge_type', [
-  'extends',
-  'improves',
-  'uses',
-  'introduces',
-  'cites',
-  'evaluates_on',
-  'compares_to',
-  'authored_by'
-]);
+// Node and edge `type` columns are intentionally free-form `text` (not pgEnum):
+// the extractor can discover new entity/relationship types and they are stored
+// without an `ALTER TYPE` migration. `KNOWN_NODE_TYPES`/`KNOWN_EDGE_TYPES` in the
+// shared package are the well-known defaults used for UI seeding, not a constraint.
 
 export const processingStatusEnum = pgEnum('processing_status', [
   'pending',
@@ -45,6 +37,7 @@ export const papers = pgTable('papers', {
   pdfUrl: text('pdf_url'),
   publicationDate: date('publication_date'),
   venue: text('venue'),
+  domain: text('domain'),
   rawText: text('raw_text'),
   processed: boolean('processed').default(false).notNull(),
   processingStatus: processingStatusEnum('processing_status').default('pending').notNull(),
@@ -56,6 +49,7 @@ export const papers = pgTable('papers', {
   arxivIdIdx: index('papers_arxiv_id_idx').on(table.arxivId),
   processedIdx: index('papers_processed_idx').on(table.processed),
   processingStatusIdx: index('papers_processing_status_idx').on(table.processingStatus),
+  domainIdx: index('papers_domain_idx').on(table.domain),
 }));
 
 export const authors = pgTable('authors', {
@@ -78,7 +72,8 @@ export const paperAuthors = pgTable('paper_authors', {
 
 export const nodes = pgTable('nodes', {
   id: uuid('id').defaultRandom().primaryKey(),
-  type: nodeTypeEnum('type').notNull(),
+  type: text('type').notNull(),
+  domain: text('domain'),
   name: text('name').notNull(),
   normalizedName: text('normalized_name'),
   description: text('description'),
@@ -90,13 +85,15 @@ export const nodes = pgTable('nodes', {
   typeIdx: index('nodes_type_idx').on(table.type),
   normalizedNameIdx: index('nodes_normalized_name_idx').on(table.normalizedName),
   paperIdIdx: index('nodes_paper_id_idx').on(table.paperId),
+  domainTypeIdx: index('nodes_domain_type_idx').on(table.domain, table.type),
 }));
 
 export const edges = pgTable('edges', {
   id: uuid('id').defaultRandom().primaryKey(),
   sourceId: uuid('source_id').notNull().references(() => nodes.id, { onDelete: 'cascade' }),
   targetId: uuid('target_id').notNull().references(() => nodes.id, { onDelete: 'cascade' }),
-  type: edgeTypeEnum('type').notNull(),
+  type: text('type').notNull(),
+  domain: text('domain'),
   properties: jsonb('properties'),
   confidence: decimal('confidence', { precision: 3, scale: 2 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
@@ -106,6 +103,7 @@ export const edges = pgTable('edges', {
   typeIdx: index('edges_type_idx').on(table.type),
   sourceTypeIdx: index('edges_source_type_idx').on(table.sourceId, table.type),
   targetTypeIdx: index('edges_target_type_idx').on(table.targetId, table.type),
+  domainTypeIdx: index('edges_domain_type_idx').on(table.domain, table.type),
 }));
 
 export const sources = pgTable('sources', {
@@ -168,9 +166,11 @@ export const propositions = pgTable('propositions', {
   embedding: jsonb('embedding'),                 // number[] | null
   nodeIds: jsonb('node_ids'),                    // string[] (uuids this proposition mentions)
   section: text('section'),
+  domain: text('domain'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 }, (table) => ({
   paperIdIdx: index('propositions_paper_id_idx').on(table.paperId),
+  domainIdx: index('propositions_domain_idx').on(table.domain),
 }));
 
 // Cached GraphRAG-style community summaries: one LLM summary per cluster,
@@ -178,6 +178,7 @@ export const propositions = pgTable('propositions', {
 export const communities = pgTable('communities', {
   id: uuid('id').defaultRandom().primaryKey(),
   label: text('label'),
+  domain: text('domain'),                        // which domain this community belongs to
   nodeIds: jsonb('node_ids'),                    // string[] (uuids)
   summary: text('summary'),
   embedding: jsonb('embedding'),                 // number[] | null

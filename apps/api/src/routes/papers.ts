@@ -78,7 +78,7 @@ papersRouter.get('/:id', async (c) => {
 papersRouter.post('/', async (c) => {
   try {
     const body = await c.req.json();
-    const { title, abstract, arxivId, doi, pdfUrl, publicationDate, venue, rawText } = body;
+    const { title, abstract, arxivId, doi, pdfUrl, publicationDate, venue, rawText, domain } = body;
 
     if (!title) {
       return c.json({ error: 'Title is required' }, 400);
@@ -95,6 +95,7 @@ papersRouter.post('/', async (c) => {
         publicationDate,
         venue,
         rawText,
+        domain: domain || null,
       })
       .returning();
 

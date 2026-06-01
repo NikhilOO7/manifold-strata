@@ -3,6 +3,8 @@ import { db } from '../db';
 import { nodes, edges, sources, papers } from '../db/schema';
 import { eq, sql, ilike, and, or, inArray } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/pg-core';
+import { getDomain } from '../domains';
+import { domainWhere } from '../domains/filter';
 
 export const graphRouter = new Hono();
 
@@ -10,17 +12,23 @@ graphRouter.get('/nodes', async (c) => {
   try {
     const type = c.req.query('type');
     const search = c.req.query('search');
+    const domainParam = c.req.query('domain');
     const limit = parseInt(c.req.query('limit') || '100');
     const offset = parseInt(c.req.query('offset') || '0');
 
     let conditions = [];
-    
+
     if (type) {
       conditions.push(eq(nodes.type, type as any));
     }
 
     if (search) {
       conditions.push(ilike(nodes.name, `%${search}%`));
+    }
+
+    if (domainParam) {
+      const dw = domainWhere(nodes.domain, getDomain(domainParam).id);
+      if (dw) conditions.push(dw);
     }
 
     const query = conditions.length > 0
@@ -96,8 +104,16 @@ graphRouter.get('/nodes/:id', async (c) => {
 graphRouter.get('/edges', async (c) => {
   try {
     const type = c.req.query('type');
+    const domainParam = c.req.query('domain');
     const limit = parseInt(c.req.query('limit') || '100');
     const offset = parseInt(c.req.query('offset') || '0');
+
+    const conds = [];
+    if (type) conds.push(eq(edges.type, type as any));
+    if (domainParam) {
+      const dw = domainWhere(edges.domain, getDomain(domainParam).id);
+      if (dw) conds.push(dw);
+    }
 
     // Single query with two joins (source + target) instead of 1 + N target
     // lookups. `alias` lets us join the nodes table twice.
@@ -113,7 +129,7 @@ graphRouter.get('/edges', async (c) => {
       .from(edges)
       .innerJoin(sourceNodes, eq(edges.sourceId, sourceNodes.id))
       .innerJoin(targetNodes, eq(edges.targetId, targetNodes.id))
-      .where(type ? eq(edges.type, type as any) : undefined)
+      .where(conds.length ? and(...conds) : undefined)
       .limit(limit)
       .offset(offset);
 
@@ -211,12 +227,18 @@ graphRouter.get('/subgraph', async (c) => {
 
 graphRouter.get('/stats', async (c) => {
   try {
+    const domainParam = c.req.query('domain');
+    const ndw = domainParam ? domainWhere(nodes.domain, getDomain(domainParam).id) : undefined;
+    const edw = domainParam ? domainWhere(edges.domain, getDomain(domainParam).id) : undefined;
+    const pdw = domainParam ? domainWhere(papers.domain, getDomain(domainParam).id) : undefined;
+
     const nodeStats = await db
       .select({
         type: nodes.type,
         count: sql<number>`count(*)::int`,
       })
       .from(nodes)
+      .where(ndw)
       .groupBy(nodes.type);
 
     const edgeStats = await db
@@ -225,6 +247,7 @@ graphRouter.get('/stats', async (c) => {
         count: sql<number>`count(*)::int`,
       })
       .from(edges)
+      .where(edw)
       .groupBy(edges.type);
 
     const paperStats = await db
@@ -232,7 +255,8 @@ graphRouter.get('/stats', async (c) => {
         total: sql<number>`count(*)::int`,
         processed: sql<number>`sum(case when processed then 1 else 0 end)::int`,
       })
-      .from(papers);
+      .from(papers)
+      .where(pdw);
 
     const totalNodes = nodeStats.reduce((sum, stat) => sum + stat.count, 0);
     const totalEdges = edgeStats.reduce((sum, stat) => sum + stat.count, 0);
@@ -254,6 +278,28 @@ graphRouter.get('/stats', async (c) => {
   } catch (error) {
     console.error('Error fetching stats:', error);
     return c.json({ error: 'Failed to fetch stats' }, 500);
+  }
+});
+
+// Distinct node/edge types actually present in the graph. Lets the UI populate
+// type filters dynamically instead of from a hardcoded list, so newly discovered
+// types appear automatically.
+graphRouter.get('/types', async (c) => {
+  try {
+    const domainParam = c.req.query('domain');
+    const ndw = domainParam ? domainWhere(nodes.domain, getDomain(domainParam).id) : undefined;
+    const edw = domainParam ? domainWhere(edges.domain, getDomain(domainParam).id) : undefined;
+
+    const nodeTypeRows = await db.selectDistinct({ type: nodes.type }).from(nodes).where(ndw);
+    const edgeTypeRows = await db.selectDistinct({ type: edges.type }).from(edges).where(edw);
+
+    return c.json({
+      nodeTypes: nodeTypeRows.map((r) => r.type).filter(Boolean).sort(),
+      edgeTypes: edgeTypeRows.map((r) => r.type).filter(Boolean).sort(),
+    });
+  } catch (error) {
+    console.error('Error fetching types:', error);
+    return c.json({ error: 'Failed to fetch types' }, 500);
   }
 });
 

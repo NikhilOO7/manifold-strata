@@ -7,6 +7,7 @@ import { papersRouter } from './routes/papers';
 import { graphRouter } from './routes/graph';
 import { ingestRouter } from './routes/ingest';
 import { fieldRouter } from './routes/field';
+import { domainsRouter } from './routes/domains';
 import { apiKeyAuth, authEnabled } from './middleware/auth';
 import { rateLimit } from './middleware/rate-limit';
 import { recoverOrphanedJobs } from './queue';
@@ -30,6 +31,7 @@ app.use('/api/papers/*', rateLimit({ windowMs: 60_000, limit: 200 }));
 app.on('POST', '/api/ingest/*', apiKeyAuth());
 app.on('POST', '/api/papers/*', apiKeyAuth());
 app.on(['POST', 'PUT', 'DELETE'], '/api/field/*', apiKeyAuth());
+app.on(['POST', 'PUT', 'DELETE'], '/api/domains/*', apiKeyAuth());
 
 app.get('/health', async (c) => {
   const ollamaConnected = await checkOllamaConnection();
@@ -74,7 +76,12 @@ app.get('/', (c) => {
         arxiv: 'POST /api/ingest/arxiv',
         bulk: 'POST /api/ingest/bulk',
         status: 'GET /api/ingest/status/:jobId',
-        seed: 'GET /api/ingest/seed/gaussian-splatting',
+        seed: 'GET /api/ingest/seed/:domain',
+      },
+      domains: {
+        list: 'GET /api/domains',
+        get: 'GET /api/domains/:id',
+        backfill: 'POST /api/domains/backfill',
       },
       field: {
         query: 'POST /api/field/query',
@@ -93,6 +100,7 @@ app.route('/api/papers', papersRouter);
 app.route('/api/graph', graphRouter);
 app.route('/api/ingest', ingestRouter);
 app.route('/api/field', fieldRouter);
+app.route('/api/domains', domainsRouter);
 
 app.notFound((c) => {
   return c.json({ error: 'Not found', path: c.req.path }, 404);

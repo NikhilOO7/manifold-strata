@@ -11,20 +11,34 @@ export default function Explorer() {
   const [nodeTypeFilter, setNodeTypeFilter] = useState<string>('');
   const [minConfidence, setMinConfidence] = useState(0);
   const [nodeLimit, setNodeLimit] = useState(100);
+  const [domainFilter, setDomainFilter] = useState('');
+
+  const { data: domainsData } = useQuery({
+    queryKey: ['domains'],
+    queryFn: () => api.domains.list(),
+  });
 
   const { data: nodesData, isLoading } = useQuery({
-    queryKey: ['nodes', nodeTypeFilter, searchTerm, nodeLimit],
+    queryKey: ['nodes', nodeTypeFilter, searchTerm, nodeLimit, domainFilter],
     queryFn: () =>
       api.graph.nodes({
         type: nodeTypeFilter || undefined,
         search: searchTerm || undefined,
         limit: nodeLimit,
+        domain: domainFilter || undefined,
       }),
   });
 
   const { data: edgesData } = useQuery({
-    queryKey: ['edges'],
-    queryFn: () => api.graph.edges({ limit: 500 }),
+    queryKey: ['edges', domainFilter],
+    queryFn: () => api.graph.edges({ limit: 500, domain: domainFilter || undefined }),
+  });
+
+  // Node types present in the graph — drives the filter dropdown dynamically so
+  // newly discovered types show up without code changes (scoped to the domain).
+  const { data: typesData } = useQuery({
+    queryKey: ['graph-types', domainFilter],
+    queryFn: () => api.graph.types(domainFilter || undefined),
   });
 
   const { data: selectedNodeData } = useQuery({
@@ -33,15 +47,21 @@ export default function Explorer() {
     enabled: !!selectedNodeId,
   });
 
+  // Stable colors for known types; any newly discovered type gets a deterministic
+  // color from the palette (hashed by name) so it's consistent across renders.
   const getNodeColor = (type: string): string => {
-    const colors: Record<string, string> = {
+    const known: Record<string, string> = {
       paper: '#3b82f6',
       method: '#10b981',
       concept: '#f59e0b',
       dataset: '#8b5cf6',
       metric: '#ef4444',
     };
-    return colors[type] || '#6b7280';
+    if (known[type]) return known[type];
+    const palette = ['#06b6d4', '#ec4899', '#84cc16', '#f97316', '#6366f1', '#14b8a6', '#a855f7', '#eab308'];
+    let h = 0;
+    for (let i = 0; i < type.length; i++) h = (h * 31 + type.charCodeAt(i)) >>> 0;
+    return palette[h % palette.length];
   };
 
   // Build flow nodes/edges: filter edges by confidence and to the currently
@@ -133,16 +153,28 @@ export default function Explorer() {
                 />
               </div>
               <select
+                value={domainFilter}
+                onChange={(e) => setDomainFilter(e.target.value)}
+                className="px-4 py-3 border-2 border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all duration-200 text-gray-700 font-medium bg-white"
+              >
+                <option value="">All Domains</option>
+                {(domainsData?.domains ?? []).map((d) => (
+                  <option key={d.id} value={d.id}>
+                    {d.name}
+                  </option>
+                ))}
+              </select>
+              <select
                 value={nodeTypeFilter}
                 onChange={(e) => setNodeTypeFilter(e.target.value)}
                 className="px-4 py-3 border-2 border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all duration-200 text-gray-700 font-medium bg-white"
               >
                 <option value="">All Types</option>
-                <option value="paper">Paper</option>
-                <option value="method">Method</option>
-                <option value="concept">Concept</option>
-                <option value="dataset">Dataset</option>
-                <option value="metric">Metric</option>
+                {(typesData?.nodeTypes ?? []).map((t) => (
+                  <option key={t} value={t}>
+                    {t.charAt(0).toUpperCase() + t.slice(1).replace(/_/g, ' ')}
+                  </option>
+                ))}
               </select>
             </div>
 

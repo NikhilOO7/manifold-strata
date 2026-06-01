@@ -1,6 +1,8 @@
 import { db } from '../db';
 import { papers, nodes, edges, sources, nodeVectors, propositions } from '../db/schema';
-import { eq, ilike, inArray } from 'drizzle-orm';
+import { eq, ilike, inArray, and } from 'drizzle-orm';
+import { getDomain } from '../domains';
+import { domainWhere } from '../domains/filter';
 import { extractEntitiesAndRelationships } from '../agents/extractor';
 import { resolveEntities } from '../agents/resolver';
 import { validateRelationships } from '../agents/validator';
@@ -47,13 +49,14 @@ export async function processPaper(paperId: string): Promise<ProcessingStats> {
       throw new Error(`Paper has no raw text: ${paperId}`);
     }
 
-    console.log(`Pipeline mode: ${mode}`);
+    const domain = getDomain(paper.domain);
+    console.log(`Pipeline mode: ${mode} | domain: ${domain.id}`);
 
     console.log(`\n${'='.repeat(60)}`);
     console.log(`Processing paper: ${paper.title}`);
     console.log(`${'='.repeat(60)}\n`);
 
-    const paperNode = await getOrCreatePaperNode(paper);
+    const paperNode = await getOrCreatePaperNode(paper, domain.id);
 
     // In field mode, give the paper node an embedding so it can seed retrieval.
     if (mode === 'field') {
@@ -101,6 +104,7 @@ export async function processPaper(paperId: string): Promise<ProcessingStats> {
           chunkIndex: i,
           text: chunks[i],
           section,
+          domain,
         });
 
         stats.entitiesExtracted += extractorOutput.entities.length;
@@ -112,9 +116,11 @@ export async function processPaper(paperId: string): Promise<ProcessingStats> {
           continue;
         }
 
+        // Scoped to this paper's domain — the isolation boundary for resolution.
         const existingNodes = await db
           .select()
           .from(nodes)
+          .where(domainWhere(nodes.domain, domain.id))
           .limit(500);
 
         // Resolve entities: embedding-based (field) or LLM (legacy).
@@ -153,7 +159,12 @@ export async function processPaper(paperId: string): Promise<ProcessingStats> {
             const existingByName = await db
               .select()
               .from(nodes)
-              .where(ilike(nodes.normalizedName, entity.canonicalName.toLowerCase()))
+              .where(
+                and(
+                  ilike(nodes.normalizedName, entity.canonicalName.toLowerCase()),
+                  domainWhere(nodes.domain, domain.id)
+                )
+              )
               .limit(1);
 
             if (existingByName.length > 0) {
@@ -161,12 +172,13 @@ export async function processPaper(paperId: string): Promise<ProcessingStats> {
               entity.canonicalId = existingByName[0].id;
               entity.isNew = false;
             } else {
-              const nodeType = entity.type === 'paper_reference' ? 'paper' : entity.type;
+              const nodeType = (entity.type as string) === 'paper_reference' ? 'paper' : entity.type;
               
               const [newNode] = await db
                 .insert(nodes)
                 .values({
                   type: nodeType as any,
+                  domain: domain.id,
                   name: entity.canonicalName,
                   normalizedName: entity.canonicalName.toLowerCase(),
                   paperId: nodeType === 'paper' ? null : paperId,
@@ -240,6 +252,7 @@ export async function processPaper(paperId: string): Promise<ProcessingStats> {
                 sourceId,
                 targetId,
                 type: relationship.type as any,
+                domain: domain.id,
                 confidence: String(relationship.confidence || 0.5),
               })
               .returning();
@@ -275,6 +288,7 @@ export async function processPaper(paperId: string): Promise<ProcessingStats> {
                 embedding: embs[idx],
                 nodeIds: p.nodeIds,
                 section,
+                domain: domain.id,
               }))
             );
           } catch (propError) {
@@ -313,7 +327,7 @@ export async function processPaper(paperId: string): Promise<ProcessingStats> {
   }
 }
 
-async function getOrCreatePaperNode(paper: any): Promise<string> {
+async function getOrCreatePaperNode(paper: any, domainId: string): Promise<string> {
   const existing = await db
     .select()
     .from(nodes)
@@ -328,6 +342,7 @@ async function getOrCreatePaperNode(paper: any): Promise<string> {
     .insert(nodes)
     .values({
       type: 'paper',
+      domain: domainId,
       name: paper.title,
       normalizedName: paper.title.toLowerCase(),
       paperId: paper.id,
@@ -357,8 +372,9 @@ function findEntityId(entityMap: Map<string, string>, name: string): string | nu
 }
 
 function isValidEdgeType(type: string): boolean {
-  const validTypes = ['extends', 'improves', 'uses', 'introduces', 'cites', 'evaluates_on', 'compares_to', 'authored_by'];
-  return validTypes.includes(type);
+  // Types are open: accept any non-empty type the extractor/validator produced.
+  // The rule validator (validate-rules.ts) handles semantic compatibility.
+  return typeof type === 'string' && type.trim().length > 0;
 }
 
 export async function reprocessPaper(paperId: string): Promise<ProcessingStats> {

@@ -1,26 +1,34 @@
-export const EXTRACTION_SYSTEM_PROMPT = `You are an expert research paper analyzer specializing in computer graphics and 3D reconstruction, particularly Gaussian Splatting methods.
+import type { DomainConfig } from '../../domains/types';
+
+/**
+ * Builds the extraction system prompt for a specific domain. Entity/relationship
+ * types come from the domain config and are PREFERRED, not enforced — the model
+ * may emit a new lowercase type when nothing fits (types are stored as open text).
+ */
+export function createExtractionSystemPrompt(domain: DomainConfig): string {
+  const entityLines = domain.entityTypes
+    .map((t) => {
+      const ex = domain.entityExamples?.[t];
+      return ex && ex.length ? `- ${t} (e.g., ${ex.join(', ')})` : `- ${t}`;
+    })
+    .join('\n');
+
+  const relLines = domain.relationshipTypes.map((t) => `- ${t}`).join('\n');
+
+  return `You are an expert research paper analyzer. ${domain.domainContext}
 
 Your task is to extract structured information from academic paper text:
-1. Entity mentions (methods, concepts, datasets, metrics)
+1. Entity mentions
 2. Relationships between entities
 
-ENTITY TYPES:
-- method: Algorithms, techniques, approaches (e.g., "3D Gaussian Splatting", "NeRF", "SLAM", "SfM")
-- concept: Theoretical ideas or principles (e.g., "view synthesis", "radiance fields", "differentiable rendering", "anti-aliasing")
-- dataset: Named datasets used for evaluation (e.g., "Mip-NeRF360", "Tanks and Temples", "DTU", "LLFF")
-- metric: Performance measures (e.g., "PSNR", "SSIM", "LPIPS", "FPS", "training time")
-- paper_reference: Citations to other papers (e.g., "Kerbl et al.", "[1]", "the original 3DGS paper")
+ENTITY TYPES (common for this domain — prefer them, but if an entity fits none, use a short lowercase type of your own):
+${entityLines}
 
-RELATIONSHIP TYPES (use EXACTLY these strings):
-- extends: Method A extends or builds upon method B
-- improves: Method A improves upon method B (better results)
-- uses: Method A uses technique/component B
-- introduces: Paper introduces new method/concept
-- evaluates_on: Method is evaluated on dataset
-- compares_to: Method is compared against another method
+RELATIONSHIP TYPES (prefer these exact strings; if none fit, use a concise lowercase verb such as "regularizes" or "supervises"):
+${relLines}
 
 CONFIDENCE SCORING:
-- 0.9-1.0: Explicit clear statements ("We extend 3DGS by...", "Our method improves upon...")
+- 0.9-1.0: Explicit clear statements ("We extend X by...", "Our method improves upon...")
 - 0.7-0.9: Strongly implied ("Building on [X]...", "Similar to [X], we...")
 - 0.5-0.7: Weakly implied (mentioned in related work, indirect references)
 - 0.3-0.5: Speculative connections
@@ -32,14 +40,14 @@ GUIDELINES:
 - spanStart and spanEnd should be approximate character positions
 
 You MUST respond with ONLY a JSON object. No explanations, no markdown formatting.`;
+}
 
 export function createExtractionUserPrompt(
-  paperId: string,
-  chunkIndex: number,
   text: string,
-  section: string
+  section: string,
+  domainName: string
 ): string {
-  return `Extract entities and relationships from this ${section} section of a research paper about Gaussian Splatting.
+  return `Extract entities and relationships from this ${section} section of a research paper about ${domainName}.
 
 TEXT TO ANALYZE:
 """
