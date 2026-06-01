@@ -1,27 +1,30 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import ReactFlow, { Background, Controls, MiniMap } from 'reactflow';
 import 'reactflow/dist/style.css';
 import { api } from '../lib/api';
+import { computeForceLayout } from '../lib/layout';
 
 export default function Explorer() {
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [nodeTypeFilter, setNodeTypeFilter] = useState<string>('');
+  const [minConfidence, setMinConfidence] = useState(0);
+  const [nodeLimit, setNodeLimit] = useState(100);
 
   const { data: nodesData, isLoading } = useQuery({
-    queryKey: ['nodes', nodeTypeFilter, searchTerm],
+    queryKey: ['nodes', nodeTypeFilter, searchTerm, nodeLimit],
     queryFn: () =>
       api.graph.nodes({
         type: nodeTypeFilter || undefined,
         search: searchTerm || undefined,
-        limit: 100,
+        limit: nodeLimit,
       }),
   });
 
   const { data: edgesData } = useQuery({
     queryKey: ['edges'],
-    queryFn: () => api.graph.edges({ limit: 200 }),
+    queryFn: () => api.graph.edges({ limit: 500 }),
   });
 
   const { data: selectedNodeData } = useQuery({
@@ -41,36 +44,44 @@ export default function Explorer() {
     return colors[type] || '#6b7280';
   };
 
-  // Improved layout algorithm - spread nodes in a circle with more spacing
-  const nodes =
-    nodesData?.nodes.map((node, index) => {
-      const total = nodesData.nodes.length;
-      const radius = Math.max(400, total * 15); // Dynamic radius based on node count
-      const angle = (index / total) * 2 * Math.PI;
-      const x = Math.cos(angle) * radius + 600; // Center at 600, 400
-      const y = Math.sin(angle) * radius + 400;
+  // Build flow nodes/edges: filter edges by confidence and to the currently
+  // loaded node set, then run a force-directed layout so related nodes cluster.
+  const { flowNodes, flowEdges, totalEdges } = useMemo(() => {
+    const rawNodes = nodesData?.nodes ?? [];
+    const rawEdges = edgesData?.edges ?? [];
+    const visibleIds = new Set(rawNodes.map((n) => n.id));
 
-      return {
-        id: node.id,
-        data: { label: node.name },
-        position: { x, y },
-        style: {
-          background: getNodeColor(node.type),
-          color: '#fff',
-          padding: 10,
-          borderRadius: 8,
-          fontSize: 12,
-          fontWeight: 600,
-          border: '2px solid rgba(255,255,255,0.2)',
-          boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)',
-          minWidth: 120,
-          textAlign: 'center' as const,
-        },
-      };
-    }) || [];
+    const keptEdges = rawEdges.filter(
+      (e) =>
+        visibleIds.has(e.sourceId) &&
+        visibleIds.has(e.targetId) &&
+        parseFloat(e.confidence ?? '0') >= minConfidence
+    );
 
-  const edges =
-    edgesData?.edges.map((edge) => ({
+    const positions = computeForceLayout(
+      rawNodes.map((n) => ({ id: n.id })),
+      keptEdges.map((e) => ({ source: e.sourceId, target: e.targetId }))
+    );
+
+    const flowNodes = rawNodes.map((node) => ({
+      id: node.id,
+      data: { label: node.name },
+      position: positions.get(node.id) ?? { x: 0, y: 0 },
+      style: {
+        background: getNodeColor(node.type),
+        color: '#fff',
+        padding: 10,
+        borderRadius: 8,
+        fontSize: 12,
+        fontWeight: 600,
+        border: '2px solid rgba(255,255,255,0.2)',
+        boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)',
+        minWidth: 120,
+        textAlign: 'center' as const,
+      },
+    }));
+
+    const flowEdges = keptEdges.map((edge) => ({
       id: edge.id,
       source: edge.sourceId,
       target: edge.targetId,
@@ -78,7 +89,10 @@ export default function Explorer() {
       type: 'smoothstep',
       style: { stroke: '#9ca3af', strokeWidth: 2 },
       labelStyle: { fill: '#6b7280', fontWeight: 600, fontSize: 12 },
-    })) || [];
+    }));
+
+    return { flowNodes, flowEdges, totalEdges: rawEdges.length };
+  }, [nodesData, edgesData, minConfidence]);
 
   return (
     <div className="space-y-6 animate-fadeIn">
@@ -131,6 +145,49 @@ export default function Explorer() {
                 <option value="metric">Metric</option>
               </select>
             </div>
+
+            {/* Filters: confidence threshold + node limit + live counts */}
+            <div className="flex items-center gap-6 mt-3 flex-wrap">
+              <div className="flex items-center gap-3">
+                <label className="text-sm font-medium text-gray-600 whitespace-nowrap">
+                  Min confidence
+                </label>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  value={minConfidence}
+                  onChange={(e) => setMinConfidence(parseFloat(e.target.value))}
+                  className="w-40 accent-blue-600"
+                />
+                <span className="text-sm font-mono text-gray-700 w-10">
+                  {minConfidence.toFixed(2)}
+                </span>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <label className="text-sm font-medium text-gray-600 whitespace-nowrap">
+                  Max nodes
+                </label>
+                <select
+                  value={nodeLimit}
+                  onChange={(e) => setNodeLimit(parseInt(e.target.value))}
+                  className="px-3 py-2 border-2 border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 font-medium bg-white text-sm"
+                >
+                  <option value={50}>50</option>
+                  <option value={100}>100</option>
+                  <option value={200}>200</option>
+                  <option value={500}>500</option>
+                </select>
+              </div>
+
+              <div className="text-sm text-gray-500 ml-auto">
+                <span className="font-semibold text-gray-700">{flowNodes.length}</span> nodes ·{' '}
+                <span className="font-semibold text-gray-700">{flowEdges.length}</span>
+                {totalEdges > flowEdges.length ? ` of ${totalEdges}` : ''} edges
+              </div>
+            </div>
           </div>
 
           {/* Graph Display */}
@@ -147,8 +204,8 @@ export default function Explorer() {
             </div>
           ) : (
             <ReactFlow
-              nodes={nodes}
-              edges={edges}
+              nodes={flowNodes}
+              edges={flowEdges}
               onNodeClick={(_, node) => setSelectedNodeId(node.id)}
               fitView
             >

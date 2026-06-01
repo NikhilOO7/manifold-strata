@@ -3,6 +3,7 @@ import { db } from '../db';
 import { papers } from '../db/schema';
 import { eq, desc, inArray } from 'drizzle-orm';
 import { processPaper } from '../pipeline/processor';
+import { paperQueue, createJob, setJobStatus } from '../queue';
 
 export const papersRouter = new Hono();
 
@@ -142,13 +143,33 @@ papersRouter.post('/:id/process', async (c) => {
       })
       .where(eq(papers.id, id));
 
-    await processPaper(id);
+    // Enqueue on the background worker instead of blocking the request for
+    // minutes. Progress is observable via /api/papers/processing and the job
+    // status endpoint.
+    const jobId = `job-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+    await createJob(jobId, 'process', { status: 'queued', paperId: id });
+
+    paperQueue.enqueue(async () => {
+      try {
+        await setJobStatus(jobId, { status: 'processing', paperId: id });
+        await processPaper(id);
+        await setJobStatus(jobId, { status: 'completed', paperId: id });
+      } catch (err) {
+        console.error('Error in processing pipeline:', err);
+        await setJobStatus(jobId, {
+          status: 'failed',
+          paperId: id,
+          error: err instanceof Error ? err.message : 'Unknown error',
+        });
+      }
+    });
 
     return c.json({
-      message: 'Processing complete',
+      message: 'Processing started',
       paperId: id,
-      status: 'completed'
-    });
+      jobId,
+      status: 'queued'
+    }, 202);
   } catch (error) {
     console.error('Error processing paper:', error);
     return c.json({ 

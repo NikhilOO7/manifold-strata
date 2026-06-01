@@ -26,6 +26,16 @@ export const processingStatusEnum = pgEnum('processing_status', [
   'failed'
 ]);
 
+export const jobStatusEnum = pgEnum('job_status', [
+  'queued',
+  'fetching_metadata',
+  'downloading_pdf',
+  'extracting_text',
+  'processing',
+  'completed',
+  'failed'
+]);
+
 export const papers = pgTable('papers', {
   id: uuid('id').defaultRandom().primaryKey(),
   title: text('title').notNull(),
@@ -111,6 +121,24 @@ export const sources = pgTable('sources', {
 }, (table) => ({
   edgeIdIdx: index('sources_edge_id_idx').on(table.edgeId),
   paperIdIdx: index('sources_paper_id_idx').on(table.paperId),
+}));
+
+// Durable background-job records. Replaces the previous in-memory Map so job
+// status survives server restarts and is queryable across processes. The
+// in-process worker (apps/api/src/queue) claims and runs these.
+export const jobs = pgTable('jobs', {
+  id: text('id').primaryKey(),                     // "job-{timestamp}-{random}"
+  type: text('type').notNull(),                    // 'ingest' | 'process'
+  status: jobStatusEnum('status').default('queued').notNull(),
+  paperId: uuid('paper_id').references(() => papers.id, { onDelete: 'set null' }),
+  progress: text('progress'),                      // human-readable status message
+  error: text('error'),
+  metadata: jsonb('metadata'),                     // flexible payload (arxivId, autoProcess, ...)
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+}, (table) => ({
+  statusIdx: index('jobs_status_idx').on(table.status),
+  paperIdIdx: index('jobs_paper_id_idx').on(table.paperId),
 }));
 
 // --- Manifold: geometric knowledge field ---------------------------------

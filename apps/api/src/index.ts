@@ -7,6 +7,9 @@ import { papersRouter } from './routes/papers';
 import { graphRouter } from './routes/graph';
 import { ingestRouter } from './routes/ingest';
 import { fieldRouter } from './routes/field';
+import { apiKeyAuth, authEnabled } from './middleware/auth';
+import { rateLimit } from './middleware/rate-limit';
+import { recoverOrphanedJobs } from './queue';
 import { checkOllamaConnection, warmupModel } from './services/ollama';
 
 const app = new Hono();
@@ -16,6 +19,17 @@ app.use('*', cors({
   origin: ['http://localhost:5173', 'http://localhost:3000', 'http://localhost:5174'],
   credentials: true,
 }));
+
+// Rate limiting — strict on LLM-backed routes, lenient on read-only queries.
+app.use('/api/ingest/*', rateLimit({ windowMs: 60_000, limit: 10 }));
+app.use('/api/field/*', rateLimit({ windowMs: 60_000, limit: 30 }));
+app.use('/api/graph/*', rateLimit({ windowMs: 60_000, limit: 200 }));
+app.use('/api/papers/*', rateLimit({ windowMs: 60_000, limit: 200 }));
+
+// API-key auth on state-changing / expensive routes (no-op unless API_KEY is set).
+app.on('POST', '/api/ingest/*', apiKeyAuth());
+app.on('POST', '/api/papers/*', apiKeyAuth());
+app.on(['POST', 'PUT', 'DELETE'], '/api/field/*', apiKeyAuth());
 
 app.get('/health', async (c) => {
   const ollamaConnected = await checkOllamaConnection();
@@ -107,6 +121,24 @@ async function startServer() {
     console.log('  → Start Ollama with: ollama serve');
     console.log('  → Pull model with: ollama pull llama3.1:8b');
     console.log('  → The API will still work, but processing will fail\n');
+  }
+
+  if (authEnabled()) {
+    console.log('✓ Auth: API key required on write routes');
+  } else {
+    console.log('✗ Auth: disabled (set API_KEY to require a key on write routes)');
+  }
+
+  try {
+    const recovered = await recoverOrphanedJobs();
+    if (recovered > 0) {
+      console.log(`✓ Recovered ${recovered} orphaned job(s) from a previous run (marked failed)`);
+    }
+  } catch (err) {
+    console.warn(
+      '! Could not recover orphaned jobs — is the DB migrated? Run `pnpm db:push`.',
+      err instanceof Error ? err.message : err
+    );
   }
 
   console.log(`\n✓ Server running at http://localhost:${port}`);

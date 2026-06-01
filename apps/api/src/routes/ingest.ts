@@ -4,6 +4,7 @@ import { papers, authors, paperAuthors } from '../db/schema';
 import { eq } from 'drizzle-orm';
 import { fetchAndExtractPDF } from '../services/pdf';
 import { processPaper } from '../pipeline/processor';
+import { paperQueue, createJob, setJobStatus, getJob } from '../queue';
 
 export const ingestRouter = new Hono();
 
@@ -54,13 +55,6 @@ async function fetchArxivMetadata(arxivId: string): Promise<ArxivMetadata> {
   };
 }
 
-const jobStatus = new Map<string, { 
-  status: 'queued' | 'fetching_metadata' | 'downloading_pdf' | 'extracting_text' | 'processing' | 'completed' | 'failed';
-  paperId?: string;
-  error?: string;
-  progress?: string;
-}>();
-
 ingestRouter.post('/arxiv', async (c) => {
   try {
     const body = await c.req.json();
@@ -87,9 +81,9 @@ ingestRouter.post('/arxiv', async (c) => {
     }
 
     const jobId = `job-${Date.now()}-${Math.random().toString(36).substring(7)}`;
-    jobStatus.set(jobId, { status: 'queued' });
+    await createJob(jobId, 'ingest', { metadata: { arxivId: cleanId, autoProcess } });
 
-    processArxivPaper(jobId, cleanId, autoProcess);
+    paperQueue.enqueue(() => processArxivPaper(jobId, cleanId, autoProcess));
 
     return c.json({ jobId, status: 'queued' }, 202);
   } catch (error) {
@@ -100,12 +94,12 @@ ingestRouter.post('/arxiv', async (c) => {
 
 async function processArxivPaper(jobId: string, arxivId: string, autoProcess: boolean) {
   try {
-    jobStatus.set(jobId, { status: 'fetching_metadata', progress: 'Fetching paper metadata from arXiv...' });
+    await setJobStatus(jobId, { status: 'fetching_metadata', progress: 'Fetching paper metadata from arXiv...' });
     
     const metadata = await fetchArxivMetadata(arxivId);
     console.log(`Fetched metadata for: ${metadata.title}`);
 
-    jobStatus.set(jobId, { status: 'downloading_pdf', progress: 'Downloading PDF...' });
+    await setJobStatus(jobId, { status: 'downloading_pdf', progress: 'Downloading PDF...' });
     
     let rawText = '';
     try {
@@ -116,7 +110,7 @@ async function processArxivPaper(jobId: string, arxivId: string, autoProcess: bo
       console.warn(`Failed to extract PDF, continuing without text: ${pdfError}`);
     }
 
-    jobStatus.set(jobId, { status: 'extracting_text', progress: 'Saving to database...' });
+    await setJobStatus(jobId, { status: 'extracting_text', progress: 'Saving to database...' });
 
     const [paper] = await db
       .insert(papers)
@@ -165,27 +159,27 @@ async function processArxivPaper(jobId: string, arxivId: string, autoProcess: bo
     }
 
     if (autoProcess && rawText) {
-      jobStatus.set(jobId, { status: 'processing', progress: 'Running AI extraction pipeline...', paperId: paper.id });
+      await setJobStatus(jobId, { status: 'processing', progress: 'Running AI extraction pipeline...', paperId: paper.id });
       
       try {
         await processPaper(paper.id);
-        jobStatus.set(jobId, { status: 'completed', paperId: paper.id });
+        await setJobStatus(jobId, { status: 'completed', paperId: paper.id });
       } catch (processError) {
         console.error('Error in processing pipeline:', processError);
-        jobStatus.set(jobId, { 
-          status: 'completed', 
+        await setJobStatus(jobId, {
+          status: 'completed',
           paperId: paper.id,
           progress: 'Paper saved but processing failed. You can retry processing later.'
         });
       }
     } else {
-      jobStatus.set(jobId, { status: 'completed', paperId: paper.id });
+      await setJobStatus(jobId, { status: 'completed', paperId: paper.id });
     }
 
     console.log(`Successfully ingested paper: ${metadata.title}`);
   } catch (error) {
     console.error('Error ingesting paper:', error);
-    jobStatus.set(jobId, {
+    await setJobStatus(jobId, {
       status: 'failed',
       error: error instanceof Error ? error.message : 'Unknown error',
     });
@@ -195,7 +189,7 @@ async function processArxivPaper(jobId: string, arxivId: string, autoProcess: bo
 ingestRouter.get('/status/:jobId', async (c) => {
   try {
     const jobId = c.req.param('jobId');
-    const status = jobStatus.get(jobId);
+    const status = await getJob(jobId);
 
     if (!status) {
       return c.json({ error: 'Job not found' }, 404);
@@ -221,36 +215,28 @@ ingestRouter.post('/bulk', async (c) => {
       return c.json({ error: 'Maximum 100 papers per batch' }, 400);
     }
 
-    const jobs: { arxivId: string; jobId: string }[] = [];
+    const queued: { arxivId: string; jobId: string }[] = [];
 
     for (const arxivId of arxivIds) {
       const cleanId = arxivId.replace('arXiv:', '').trim();
       if (!cleanId) continue;
 
-      const jobId = `job-${Date.now()}-${Math.random().toString(36).substring(7)}`;
-      jobStatus.set(jobId, { status: 'queued' });
-      
-      jobs.push({ arxivId: cleanId, jobId });
+      const jobId = `job-${Date.now()}-${Math.random().toString(36).substring(7)}-${queued.length}`;
+      await createJob(jobId, 'ingest', { metadata: { arxivId: cleanId, autoProcess } });
+      paperQueue.enqueue(() => processArxivPaper(jobId, cleanId, autoProcess));
+
+      queued.push({ arxivId: cleanId, jobId });
     }
 
-    processBulkPapers(jobs, autoProcess);
-
-    return c.json({ 
-      message: `Queued ${jobs.length} papers for ingestion`,
-      jobs: jobs.map(j => ({ arxivId: j.arxivId, jobId: j.jobId }))
+    return c.json({
+      message: `Queued ${queued.length} papers for ingestion`,
+      jobs: queued.map((j) => ({ arxivId: j.arxivId, jobId: j.jobId })),
     }, 202);
   } catch (error) {
     console.error('Error creating bulk ingestion:', error);
     return c.json({ error: 'Failed to create bulk ingestion' }, 500);
   }
 });
-
-async function processBulkPapers(jobs: { arxivId: string; jobId: string }[], autoProcess: boolean) {
-  for (const job of jobs) {
-    await processArxivPaper(job.jobId, job.arxivId, autoProcess);
-    await new Promise(resolve => setTimeout(resolve, 1000));
-  }
-}
 
 ingestRouter.get('/seed/gaussian-splatting', async (c) => {
   const seedPapers = [

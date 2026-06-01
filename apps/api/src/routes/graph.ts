@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { db } from '../db';
 import { nodes, edges, sources, papers } from '../db/schema';
 import { eq, sql, ilike, and, or, inArray } from 'drizzle-orm';
+import { alias } from 'drizzle-orm/pg-core';
 
 export const graphRouter = new Hono();
 
@@ -98,35 +99,29 @@ graphRouter.get('/edges', async (c) => {
     const limit = parseInt(c.req.query('limit') || '100');
     const offset = parseInt(c.req.query('offset') || '0');
 
-    let query = db
+    // Single query with two joins (source + target) instead of 1 + N target
+    // lookups. `alias` lets us join the nodes table twice.
+    const sourceNodes = alias(nodes, 'source_nodes');
+    const targetNodes = alias(nodes, 'target_nodes');
+
+    const results = await db
       .select({
         edge: edges,
-        sourceNode: nodes,
+        sourceNode: sourceNodes,
+        targetNode: targetNodes,
       })
       .from(edges)
-      .innerJoin(nodes, eq(edges.sourceId, nodes.id));
+      .innerJoin(sourceNodes, eq(edges.sourceId, sourceNodes.id))
+      .innerJoin(targetNodes, eq(edges.targetId, targetNodes.id))
+      .where(type ? eq(edges.type, type as any) : undefined)
+      .limit(limit)
+      .offset(offset);
 
-    if (type) {
-      query = query.where(eq(edges.type, type as any)) as any;
-    }
-
-    const results = await query.limit(limit).offset(offset);
-
-    const edgesWithNodes = await Promise.all(
-      results.map(async (r) => {
-        const [targetNode] = await db
-          .select()
-          .from(nodes)
-          .where(eq(nodes.id, r.edge.targetId))
-          .limit(1);
-        
-        return {
-          ...r.edge,
-          sourceNode: r.sourceNode,
-          targetNode,
-        };
-      })
-    );
+    const edgesWithNodes = results.map((r) => ({
+      ...r.edge,
+      sourceNode: r.sourceNode,
+      targetNode: r.targetNode,
+    }));
 
     return c.json({
       edges: edgesWithNodes,
