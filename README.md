@@ -382,11 +382,31 @@ manifold-strata/
 
 ---
 
+## Quality & evaluation
+
+Pipeline quality is measured, not asserted. `pnpm --filter api eval` runs a
+hand-curated gold set (`apps/api/src/eval/`) over the Gaussian-Splatting domain in
+three layers:
+
+- **Extraction** — entity recall and relation precision/recall/F1 against gold passages.
+- **Resolution** — checks that known aliases (`3DGS` ↔ `3D Gaussian Splatting`) collapse to one node and that distractors do not.
+- **Retrieval + faithfulness** — runs field queries against the live graph and scores evidence hit-rate and answer faithfulness with an LLM judge (skipped cleanly when the graph is empty).
+
+Each run also reports its LLM/embedding cost, so quality and cost are tracked together.
+
+## Graph maintenance: agentic repair
+
+The Validator checks relationships at insertion time; `POST /api/field/repair`
+re-audits the standing graph. It flags suspect edges with **zero LLM calls** —
+low confidence, temporal impossibilities (a paper "extending" a newer one), and
+mutual contradictions (A and B each extending the other) — then spends one judge
+call per flagged edge against its recorded provenance to keep, re-weight, or
+retract it. Dry-run by default; `{ "apply": true }` mutates.
+
 ## Limitations & future work
 
-- **Single-instance worker** — the background queue is in-process with a durable `jobs` table. Multi-instance/horizontal scale wants a shared queue (BullMQ + Redis); the job-table contract is designed so that swap is local to `apps/api/src/queue`.
-- **Status updates are polled** — the Dashboard/Ingestion pages poll every ~2s. Server-Sent Events would push updates and cut idle DB load.
-- **Vectors in JSONB** — cosine similarity is computed in JS, which is fine at this corpus size (hundreds–thousands of nodes). pgvector + an HNSW index is the path to larger graphs.
+- **Single-instance worker** — the background queue is in-process with a durable `jobs` table. Multi-instance/horizontal scale wants a shared queue (BullMQ + Redis); the job-table contract is designed so that swap is local to `apps/api/src/queue`. The live-status SSE bus (`apps/api/src/services/events.ts`) is the matching seam for Postgres `LISTEN/NOTIFY` or Redis pub/sub.
+- **Vectors in JSONB** — seed selection computes cosine in JS, fine at this corpus size (hundreds–thousands of nodes). PPR itself is now bounded (push-based local PageRank touches only the seed neighborhood), so the remaining scale step is swapping the seed cosine scan for pgvector + HNSW at the marked seam in `knowledge-field/retrieve.ts`.
 - **Domains are strictly isolated, with no cross-domain bridges** — each node lives in exactly one domain (see [Domains](#domains-multi-field-isolation)), so a concept studied in two fields becomes two nodes. A future "shared" namespace or a `domains text[]` tag could link them where it's genuinely the same entity. Domains are also config-as-code; a DB-editable registry + per-domain type-compatibility rules are natural extensions.
 - **Hyperbolic/community layers are batch** — `train-hyperbolic` and `communities/build` are run on demand, not incrementally maintained as papers arrive.
 - **Auth is a single shared key** — fine for a protected deployment; real multi-tenant use wants per-user keys / JWT and scoped permissions.

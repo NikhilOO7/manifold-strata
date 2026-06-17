@@ -90,6 +90,7 @@ app.get('/', (c) => {
         backfill: 'POST /api/field/backfill',
         trainHyperbolic: 'POST /api/field/train-hyperbolic',
         communities: 'POST /api/field/communities/build',
+        repair: 'POST /api/field/repair',
         benchmark: 'GET /api/field/benchmark',
       }
     }

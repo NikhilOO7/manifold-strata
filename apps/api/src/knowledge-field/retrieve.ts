@@ -16,7 +16,7 @@ import { getDomain } from '../domains';
 import { domainWhere } from '../domains/filter';
 import { embedOne, cosine } from '../services/embeddings';
 import { generateCompletion } from '../services/ollama';
-import { personalizedPageRank, type GraphEdge } from './ppr';
+import { localPushPPR } from './ppr';
 import { mmrSelect } from './compress';
 
 export interface RetrievedEvidence {
@@ -67,6 +67,11 @@ export async function retrieveField(
   ).filter((v) => nodeIdSet.has(v.nodeId));
 
   // Seeds: nodes whose embedding is closest to the query.
+  // --- pgvector swap point -------------------------------------------------
+  // This linear cosine scan over every in-domain vector is the seed-selection
+  // bottleneck at scale. Replacing it with an ANN query (pgvector + HNSW:
+  // `ORDER BY embedding <=> $query LIMIT seedK`) leaves everything below
+  // unchanged — `seeds` is the only thing the rest of retrieval consumes.
   const seedScores = vecRows
     .map((v) => ({ id: v.nodeId, score: cosine(qvec, v.embedding as number[]) }))
     .sort((a, b) => b.score - a.score)
@@ -75,22 +80,30 @@ export async function retrieveField(
   const seeds = new Map<string, number>();
   for (const s of seedScores) if (s.score > 0) seeds.set(s.id, s.score);
 
-  // Edges → PPR (same domain).
+  // Build undirected weighted adjacency once, then run BOUNDED local PPR. The
+  // push algorithm explores only the seed neighborhood, so ranking cost scales
+  // with the relevant subgraph rather than the whole domain.
   const edgeRows = await db
     .select({ sourceId: edges.sourceId, targetId: edges.targetId, confidence: edges.confidence })
     .from(edges)
     .where(domainWhere(edges.domain, domainId));
-  const graphEdges: GraphEdge[] = edgeRows.map((e) => ({
-    sourceId: e.sourceId,
-    targetId: e.targetId,
-    weight: e.confidence ? Number(e.confidence) : 0.5,
-  }));
 
-  const ppr = personalizedPageRank(
-    allNodes.map((n) => n.id),
-    graphEdges,
-    seeds
-  );
+  const adjacency = new Map<string, Array<[string, number]>>();
+  const rowSum = new Map<string, number>();
+  const addEdge = (a: string, b: string, w: number) => {
+    if (!adjacency.has(a)) adjacency.set(a, []);
+    adjacency.get(a)!.push([b, w]);
+    rowSum.set(a, (rowSum.get(a) ?? 0) + w);
+  };
+  for (const e of edgeRows) {
+    if (e.sourceId === e.targetId) continue;
+    const raw = e.confidence ? Number(e.confidence) : 0.5;
+    const weight = raw > 0 ? raw : 0.01;
+    addEdge(e.sourceId, e.targetId, weight);
+    addEdge(e.targetId, e.sourceId, weight);
+  }
+
+  const ppr = localPushPPR(adjacency, rowSum, seeds);
 
   const rankedNodes = [...ppr.entries()]
     .map(([id, score]) => ({
@@ -148,17 +161,34 @@ export async function retrieveField(
 export interface FieldQueryResult extends RetrieveResult {
   answer: string;
   llmCalls: number; // LLM calls used by THIS query (0 or 1)
+  latencyMs: number; // wall-clock for the whole query
 }
 
 export async function fieldQuery(
   question: string,
   opts: RetrieveOptions & { verbalize?: boolean } = {}
 ): Promise<FieldQueryResult> {
+  const start = Date.now();
   const result = await retrieveField(question, opts);
   const verbalize = opts.verbalize !== false;
 
+  // One structured trace line per query — the substrate for real tracing
+  // (OpenTelemetry spans) without pulling a collector into this project. It makes
+  // the "low-LLM" claim observable: a verbalized answer is 1 LLM call, retrieval
+  // is 0.
+  const trace = (llmCalls: number) => {
+    const latencyMs = Date.now() - start;
+    console.log(
+      `[trace] field.query domain=${opts.domain ?? 'default'} ` +
+        `latencyMs=${latencyMs} llmCalls=${llmCalls} ` +
+        `seeds=${result.seeds.length} ranked=${result.rankedNodes.length} ` +
+        `evidence=${result.evidence.length} contextChars=${result.contextChars}`
+    );
+    return latencyMs;
+  };
+
   if (!verbalize || result.evidence.length === 0) {
-    return { ...result, answer: '', llmCalls: 0 };
+    return { ...result, answer: '', llmCalls: 0, latencyMs: trace(0) };
   }
 
   const context = result.evidence
@@ -172,5 +202,5 @@ export async function fieldQuery(
 
   const completion = await generateCompletion(system, user, 0.2, 'verbalize');
 
-  return { ...result, answer: completion.text.trim(), llmCalls: 1 };
+  return { ...result, answer: completion.text.trim(), llmCalls: 1, latencyMs: trace(1) };
 }

@@ -1,6 +1,7 @@
-import { useState } from 'react';
-import { useMutation, useQuery } from '@tanstack/react-query';
+import { useCallback, useState } from 'react';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/api';
+import { useEventStream, type FieldEvent } from '../hooks/useEventStream';
 
 export default function Ingestion() {
   const [arxivId, setArxivId] = useState('');
@@ -8,6 +9,21 @@ export default function Ingestion() {
   const [currentJobId, setCurrentJobId] = useState<string | null>(null);
   const [showSuccess, setShowSuccess] = useState(false);
   const [selectedDomain, setSelectedDomain] = useState('default');
+  const queryClient = useQueryClient();
+
+  // Push: refresh the relevant queries the moment the server reports a change,
+  // instead of waiting for the next poll tick.
+  const onStreamEvent = useCallback(
+    (event: FieldEvent) => {
+      if (event.type === 'job') {
+        queryClient.invalidateQueries({ queryKey: ['job-status', event.jobId] });
+      }
+      queryClient.invalidateQueries({ queryKey: ['papers'] });
+      queryClient.invalidateQueries({ queryKey: ['papers', 'processing'] });
+    },
+    [queryClient]
+  );
+  useEventStream(onStreamEvent);
 
   const { data: domainsData } = useQuery({
     queryKey: ['domains'],

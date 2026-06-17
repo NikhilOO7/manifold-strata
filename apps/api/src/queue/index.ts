@@ -1,6 +1,7 @@
 import { db } from '../db';
 import { jobs } from '../db/schema';
 import { eq, inArray } from 'drizzle-orm';
+import { emitJob } from '../services/events';
 
 /**
  * In-process background worker.
@@ -61,13 +62,15 @@ export async function createJob(
   type: 'ingest' | 'process',
   fields: { status?: JobStatus; paperId?: string; metadata?: unknown } = {}
 ): Promise<void> {
+  const status = fields.status ?? 'queued';
   await db.insert(jobs).values({
     id,
     type,
-    status: fields.status ?? 'queued',
+    status,
     paperId: fields.paperId ?? null,
     metadata: (fields.metadata as any) ?? null,
   });
+  emitJob({ jobId: id, status, paperId: fields.paperId ?? null });
 }
 
 export async function setJobStatus(
@@ -78,6 +81,15 @@ export async function setJobStatus(
     .update(jobs)
     .set({ ...fields, updatedAt: new Date() })
     .where(eq(jobs.id, id));
+  if (fields.status) {
+    emitJob({
+      jobId: id,
+      status: fields.status,
+      paperId: fields.paperId ?? null,
+      progress: fields.progress ?? null,
+      error: fields.error ?? null,
+    });
+  }
 }
 
 export async function getJob(id: string) {

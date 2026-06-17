@@ -1,13 +1,45 @@
 import { Hono } from 'hono';
+import { streamSSE } from 'hono/streaming';
 import { db } from '../db';
 import { papers, authors, paperAuthors } from '../db/schema';
 import { eq } from 'drizzle-orm';
 import { fetchAndExtractPDF } from '../services/pdf';
 import { processPaper } from '../pipeline/processor';
 import { paperQueue, createJob, setJobStatus, getJob } from '../queue';
+import { onEvent } from '../services/events';
 import { getDomain } from '../domains';
 
 export const ingestRouter = new Hono();
+
+// --- Live status stream (SSE) -----------------------------------------------
+// Replaces client polling: the browser opens ONE EventSource and receives job /
+// paper-progress events as they happen. Idle connections cost nothing (no DB
+// hits) and a periodic ping keeps the connection alive through proxies.
+ingestRouter.get('/stream', (c) => {
+  return streamSSE(c, async (stream) => {
+    let open = true;
+    stream.onAbort(() => {
+      open = false;
+    });
+
+    const unsubscribe = onEvent((event) => {
+      stream.writeSSE({ event: event.type, data: JSON.stringify(event) }).catch(() => {
+        // client went away mid-write; cleanup happens in finally
+      });
+    });
+
+    try {
+      await stream.writeSSE({ event: 'ready', data: '{}' });
+      while (open) {
+        await stream.sleep(15_000);
+        if (!open) break;
+        await stream.writeSSE({ event: 'ping', data: JSON.stringify({ at: new Date().toISOString() }) });
+      }
+    } finally {
+      unsubscribe();
+    }
+  });
+});
 
 interface ArxivMetadata {
   title: string;

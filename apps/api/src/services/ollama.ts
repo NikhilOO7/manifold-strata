@@ -81,13 +81,15 @@ export async function generateCompletion(
         { role: 'user', content: userPrompt },
       ],
       temperature,
-      maxTokens: 16384,
+      maxOutputTokens: 16384,
     });
 
+    // AI SDK v5 renamed usage fields: promptTokens/completionTokens →
+    // inputTokens/outputTokens, and any field can be undefined.
     const usage = result.usage ? {
-      promptTokens: result.usage.promptTokens,
-      completionTokens: result.usage.completionTokens,
-      totalTokens: result.usage.totalTokens,
+      promptTokens: result.usage.inputTokens ?? 0,
+      completionTokens: result.usage.outputTokens ?? 0,
+      totalTokens: result.usage.totalTokens ?? 0,
     } : undefined;
 
     recordLLM(operation, usage);
@@ -107,7 +109,7 @@ export async function generateCompletion(
 export async function generateStructuredCompletion<T>(
   systemPrompt: string,
   userPrompt: string,
-  schema: any,
+  _schema: any, // reserved for schema-constrained decoding; currently prompt-guided JSON
   temperature: number = 0.7,
   retries: number = 2,
   operation: string = 'llm'

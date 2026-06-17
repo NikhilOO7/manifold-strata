@@ -8,9 +8,29 @@ import { embed, embedOne, embedModel, cosine } from '../services/embeddings';
 import { retrieveField, fieldQuery } from '../knowledge-field/retrieve';
 import { trainPoincare, hierarchyNeighbors } from '../knowledge-field/hyperbolic';
 import { buildCommunities } from '../knowledge-field/communities';
+import { repairGraph } from '../agents/repair';
 import * as metrics from '../services/metrics';
 
 export const fieldRouter = new Hono();
+
+// --- Agentic graph repair ---------------------------------------------------
+// Audit suspect edges (low-confidence / temporal or mutual contradictions)
+// against their provenance. Dry-run by default; pass { "apply": true } to mutate.
+fieldRouter.post('/repair', async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const report = await repairGraph({
+      domain: body?.domain,
+      apply: body?.apply === true,
+      confidenceThreshold: typeof body?.confidenceThreshold === 'number' ? body.confidenceThreshold : undefined,
+      maxEdges: typeof body?.maxEdges === 'number' ? body.maxEdges : undefined,
+    });
+    return c.json(report);
+  } catch (error) {
+    console.error('Repair error:', error);
+    return c.json({ error: 'Repair failed', message: String(error) }, 500);
+  }
+});
 
 function chunk<T>(arr: T[], size: number): T[][] {
   const out: T[][] = [];
@@ -166,6 +186,7 @@ fieldRouter.post('/query', async (c) => {
       question,
       answer: result.answer,
       llmCalls: result.llmCalls,
+      latencyMs: result.latencyMs,
       evidenceCount: result.evidence.length,
       contextChars: result.contextChars,
       seeds: result.seeds,

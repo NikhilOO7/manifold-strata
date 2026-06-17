@@ -102,5 +102,6 @@ export const api = {
       fetchAPI<{ status: string; paperId?: string; error?: string }>(
         `/api/ingest/status/${jobId}`
       ),
+    streamUrl: () => `${API_URL}/api/ingest/stream`,
   },
 };

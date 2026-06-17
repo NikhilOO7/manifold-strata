@@ -10,6 +10,7 @@ import { resolveEntitiesEmbed } from '../knowledge-field/resolve-embed';
 import { validateRelationshipsRules } from '../knowledge-field/validate-rules';
 import { embed, embedModel } from '../services/embeddings';
 import * as metrics from '../services/metrics';
+import { emitPaperProgress } from '../services/events';
 import { chunkText, detectSection } from '../services/pdf';
 
 type PipelineMode = 'field' | 'legacy';
@@ -94,6 +95,7 @@ export async function processPaper(paperId: string): Promise<ProcessingStats> {
         .update(papers)
         .set({ processingProgress: progress })
         .where(eq(papers.id, paperId));
+      emitPaperProgress({ paperId, status: 'extracting_entities', progress });
       
       const section = detectSection(chunks[i], i, chunks.length);
       console.log(`Detected section: ${section}`);
@@ -117,11 +119,19 @@ export async function processPaper(paperId: string): Promise<ProcessingStats> {
         }
 
         // Scoped to this paper's domain — the isolation boundary for resolution.
-        const existingNodes = await db
-          .select()
-          .from(nodes)
-          .where(domainWhere(nodes.domain, domain.id))
-          .limit(500);
+        // Field mode resolves by embedding similarity, so it needs the full
+        // in-domain node set; a blind LIMIT would silently stop deduplicating
+        // against older entities. Legacy mode stuffs nodes into an LLM prompt and
+        // must stay bounded. Either way the size is logged so the ceiling is visible.
+        const existingNodes = mode === 'field'
+          ? await db.select().from(nodes).where(domainWhere(nodes.domain, domain.id))
+          : await db.select().from(nodes).where(domainWhere(nodes.domain, domain.id)).limit(RESOLVE_LIMIT_LEGACY);
+        if (mode === 'field' && existingNodes.length > RESOLVE_WARN_THRESHOLD) {
+          console.warn(
+            `Resolution is scanning ${existingNodes.length} nodes in JS — approaching the ` +
+            `in-memory ceiling. Move seed/candidate selection to pgvector ANN before this grows further.`
+          );
+        }
 
         // Resolve entities: embedding-based (field) or LLM (legacy).
         let resolverOutput;
@@ -246,25 +256,58 @@ export async function processPaper(paperId: string): Promise<ProcessingStats> {
               relationship.type = 'uses';
             }
 
-            const [edge] = await db
-              .insert(edges)
-              .values({
-                sourceId,
-                targetId,
-                type: relationship.type as any,
-                domain: domain.id,
-                confidence: String(relationship.confidence || 0.5),
-              })
-              .returning();
+            const newConfidence = Number(relationship.confidence) || 0.5;
+
+            // Dedup: an identical (source, target, type) edge within a domain is
+            // the SAME claim seen again, not a new one. Creating a second edge
+            // double-counts that relation's weight in PPR. Instead, reinforce the
+            // existing edge's confidence (noisy-OR) and append another provenance
+            // row — every occurrence still gets recorded in `sources`.
+            const [existingEdge] = await db
+              .select()
+              .from(edges)
+              .where(
+                and(
+                  eq(edges.sourceId, sourceId),
+                  eq(edges.targetId, targetId),
+                  eq(edges.type, relationship.type),
+                  domainWhere(edges.domain, domain.id)
+                )
+              )
+              .limit(1);
+
+            let edgeId: string;
+            if (existingEdge) {
+              const combined = combineConfidence(
+                Number(existingEdge.confidence) || 0.5,
+                newConfidence
+              );
+              await db
+                .update(edges)
+                .set({ confidence: combined.toFixed(2) })
+                .where(eq(edges.id, existingEdge.id));
+              edgeId = existingEdge.id;
+            } else {
+              const [edge] = await db
+                .insert(edges)
+                .values({
+                  sourceId,
+                  targetId,
+                  type: relationship.type as any,
+                  domain: domain.id,
+                  confidence: String(newConfidence),
+                })
+                .returning();
+              edgeId = edge.id;
+              stats.relationshipsCreated++;
+            }
 
             await db.insert(sources).values({
-              edgeId: edge.id,
+              edgeId,
               paperId: paperId,
               section: section,
               extractedText: relationship.evidence?.slice(0, 1000),
             });
-
-            stats.relationshipsCreated++;
 
             if (mode === 'field' && relationship.evidence) {
               propsToWrite.push({
@@ -314,6 +357,7 @@ export async function processPaper(paperId: string): Promise<ProcessingStats> {
         updatedAt: new Date()
       })
       .where(eq(papers.id, paperId));
+    emitPaperProgress({ paperId, status: 'completed', progress: 100 });
 
     console.log(`\n${'='.repeat(60)}`);
     console.log(`Finished processing paper: ${paper.title}`);
@@ -353,22 +397,47 @@ async function getOrCreatePaperNode(paper: any, domainId: string): Promise<strin
   return paperNode.id;
 }
 
+// Legacy (LLM) resolution stuffs candidate nodes into a prompt, so it must stay
+// bounded; field mode has no such limit. Past this many in-domain nodes the JS
+// cosine scan is the bottleneck and pgvector ANN is the next step.
+const RESOLVE_LIMIT_LEGACY = 500;
+const RESOLVE_WARN_THRESHOLD = 5000;
+
+/**
+ * Noisy-OR confidence combine for an edge reinforced by repeated evidence:
+ * monotonically increasing, bounded in [0, 0.99]. Two independent 0.6 mentions
+ * → 0.84, three → ~0.94. Capped below 1 so nothing reads as certain.
+ */
+function combineConfidence(oldC: number, newC: number): number {
+  return Math.min(0.99, 1 - (1 - oldC) * (1 - newC));
+}
+
 function findEntityId(entityMap: Map<string, string>, name: string): string | null {
   if (!name) return null;
-  
-  const normalized = name.toLowerCase();
-  
+
+  const normalized = name.toLowerCase().trim();
+
+  // Exact normalized match is the common, unambiguous case.
   if (entityMap.has(normalized)) {
     return entityMap.get(normalized)!;
   }
 
+  // Guarded fuzzy fallback. Short strings ("GS", "PSNR") collide with too many
+  // keys via substring matching, so require length >= 4 on both sides AND a
+  // unique match. If more than one key matches, return null and skip the edge —
+  // a missing edge is recoverable; a wrong one silently corrupts the graph.
+  if (normalized.length < 4) return null;
+
+  const matches: string[] = [];
   for (const [key, value] of entityMap.entries()) {
+    if (key.length < 4) continue;
     if (key.includes(normalized) || normalized.includes(key)) {
-      return value;
+      matches.push(value);
+      if (matches.length > 1) return null;
     }
   }
 
-  return null;
+  return matches.length === 1 ? matches[0] : null;
 }
 
 function isValidEdgeType(type: string): boolean {
@@ -378,25 +447,19 @@ function isValidEdgeType(type: string): boolean {
 }
 
 export async function reprocessPaper(paperId: string): Promise<ProcessingStats> {
-  await db.delete(edges).where(
-    eq(edges.sourceId, paperId)
-  );
+  // Propositions reference the paper row (which survives a reprocess), so they
+  // are NOT removed by cascade and would otherwise duplicate on every rerun.
+  await db.delete(propositions).where(eq(propositions.paperId, paperId));
 
-  const paperNodes = await db
-    .select()
-    .from(nodes)
-    .where(eq(nodes.paperId, paperId));
-
-  for (const node of paperNodes) {
-    await db.delete(edges).where(eq(edges.sourceId, node.id));
-    await db.delete(edges).where(eq(edges.targetId, node.id));
-  }
-
+  // Deleting this paper's nodes cascades (FK onDelete) to their edges,
+  // node_vectors, and the sources attached to those edges — no manual per-node
+  // edge sweep needed (the previous version's first delete matched a paper id
+  // against an edge's node-id source and silently did nothing).
   await db.delete(nodes).where(eq(nodes.paperId, paperId));
 
   await db
     .update(papers)
-    .set({ processed: false })
+    .set({ processed: false, processingStatus: 'pending', processingProgress: 0 })
     .where(eq(papers.id, paperId));
 
   return processPaper(paperId);
