@@ -17,6 +17,17 @@ export interface MmrCandidate<T> {
   vector: number[];
   /** Optional prior relevance (e.g. PPR score) multiplied into query relevance. */
   prior?: number;
+  /**
+   * Pre-computed relevance in [0, 1], used instead of `cosine(query, vector)`.
+   *
+   * Retrieval fuses three ranked lists before compression, and the fused score
+   * already accounts for query similarity — recomputing cosine here would
+   * discard the graph and lexical signals and rank purely by embedding distance
+   * again. The vector is still required, because MMR needs it to measure
+   * redundancy *between selected items*, which is a different question from
+   * relevance to the query.
+   */
+  relevance?: number;
   /** Length contribution toward the budget (default: text length if present). */
   cost: number;
 }
@@ -43,7 +54,7 @@ export function mmrSelect<T>(
 
   const remaining = candidates.map((c) => ({
     ...c,
-    relevance: cosine(query, c.vector) * (c.prior ?? 1),
+    relevance: c.relevance ?? cosine(query, c.vector) * (c.prior ?? 1),
   }));
 
   const selected: Array<MmrSelection<T>> = [];

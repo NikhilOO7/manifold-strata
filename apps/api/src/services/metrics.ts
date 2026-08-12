@@ -15,6 +15,10 @@ export interface MetricBucket {
   completionTokens: number;
   embedCalls: number;
   embedTokens: number;
+  /** Total wall time spent in this operation, so latency is attributable per role. */
+  latencyMsTotal: number;
+  /** Models that served this operation — a routing table cannot silently drift. */
+  models: string[];
 }
 
 export interface MetricsSnapshot {
@@ -30,6 +34,8 @@ function emptyBucket(): MetricBucket {
     completionTokens: 0,
     embedCalls: 0,
     embedTokens: 0,
+    latencyMsTotal: 0,
+    models: [],
   };
 }
 
@@ -59,12 +65,17 @@ function bucketFor(mode: string, operation: string): MetricBucket {
 export function recordLLM(
   operation: string,
   usage?: { promptTokens?: number; completionTokens?: number },
-  mode: string = currentMode
+  mode: string = currentMode,
+  extra?: { model?: string; latencyMs?: number }
 ): void {
-  const bucket = bucketFor(mode, operation);
+  const bucket = bucketFor(mode ?? currentMode, operation);
   bucket.llmCalls += 1;
   bucket.promptTokens += usage?.promptTokens ?? 0;
   bucket.completionTokens += usage?.completionTokens ?? 0;
+  bucket.latencyMsTotal += extra?.latencyMs ?? 0;
+  if (extra?.model && !bucket.models.includes(extra.model)) {
+    bucket.models.push(extra.model);
+  }
 }
 
 export function recordEmbed(
@@ -96,6 +107,8 @@ function sumInto(target: MetricBucket, src: MetricBucket): void {
   target.completionTokens += src.completionTokens;
   target.embedCalls += src.embedCalls;
   target.embedTokens += src.embedTokens;
+  target.latencyMsTotal += src.latencyMsTotal;
+  for (const m of src.models) if (!target.models.includes(m)) target.models.push(m);
 }
 
 export function snapshot(mode: string = currentMode): MetricsSnapshot {

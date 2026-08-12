@@ -69,26 +69,37 @@ Both modes write identical output shapes, so the rest of the system is mode-agno
 ### Retrieval (`POST /api/field/query`)
 
 ```
-embed(query) → seed nodes (cosine) → Personalized PageRank → gather propositions
+embed(query) → ANN seeds (HNSW) → bounded neighbourhood expansion → Personalized
+             PageRank → three signals (graph · vector · lexical) → rank fusion
              → MMR compression (token budget) → ONE verbalize LLM call → answer
 ```
 
+Retrieval **fuses** three index-backed signals rather than choosing one, because
+measurement showed they are complementary: graph traversal is the only signal
+that answers multi-hop questions at all, while lexical ranking is near-perfect on
+direct lookups where the graph pipeline alone buried the answer. They are combined
+by Reciprocal Rank Fusion, which uses rank *positions* only — a cosine score, a
+`ts_rank`, and a PageRank mass are not on comparable scales, and normalising them
+would mean inventing a conversion that then silently decides every ranking.
+
 Multi-hop reasoning and evidence selection happen in vector/graph space; the LLM only writes the final prose. `GET /api/field/retrieve?q=...` returns the ranked evidence with no LLM call at all.
+
+Every stage is bounded by its own parameters rather than by corpus size — seeds come from the HNSW index, the graph is a capped hop expansion from those seeds, and evidence is index-backed and capped before MMR (which is quadratic in its candidate set). The response reports the working set under `stats`, so a regression back to whole-corpus reads is visible rather than silent.
 
 ---
 
 ## Tech stack
 
-**Backend** — [Hono](https://hono.dev) (API), [Drizzle ORM](https://orm.drizzle.team) + PostgreSQL 16, [Ollama](https://ollama.com) for local LLM/embeddings (OpenAI optional), `pdf-parse`, `zod`.
+**Backend** — [Hono](https://hono.dev) (API), [Drizzle ORM](https://orm.drizzle.team) + PostgreSQL 16 with [pgvector](https://github.com/pgvector/pgvector), [Ollama](https://ollama.com) for local LLM/embeddings (OpenAI optional), `pdf-parse`, `zod`.
 
 **Frontend** — React 18 + TypeScript, Vite, TailwindCSS, React Router, TanStack Query, React Flow.
 
-**Infra** — pnpm workspaces (monorepo), Docker Compose (PostgreSQL).
+**Infra** — pnpm workspaces (monorepo), Docker Compose (PostgreSQL 16 + pgvector), versioned Drizzle migrations.
 
 ### Design choices
 
-- **PostgreSQL over a graph DB** — ACID, mature tooling, and Drizzle's TypeScript integration. Graph traversal is handled with composite indexes on `(source_id, type)` / `(target_id, type)`; vectors live in JSONB with cosine computed in JS (pgvector is the documented scale path).
-- **Local LLM (Ollama) by default** — no API key or cost to run end-to-end; `LLM_PROVIDER=openai` swaps in OpenAI when you want higher-quality extraction.
+- **PostgreSQL over a graph DB** — ACID, mature tooling, and Drizzle's TypeScript integration. Graph traversal uses composite indexes on `(source_id, type)` / `(target_id, type)`; embeddings live in **pgvector** columns with HNSW indexes, so nearest-neighbour search runs in the database rather than pulling the corpus into the application.
+- **Local LLM (Ollama) by default** — no API key or cost to run end-to-end; `LLM_PROVIDER=openai` swaps in OpenAI when you want higher-quality extraction. Both providers are called over their **native HTTP APIs** rather than through a model-abstraction SDK: the abstraction layer silently drifted out of version compatibility with its Ollama provider and broke the default configuration entirely, so two direct `fetch` calls are both simpler and harder to break.
 - **Geometry over LLM calls** — the field subsystem replaces per-chunk LLM resolution/validation and multi-step retrieval with embeddings, PPR, and rule checks. Fewer calls, deterministic, debuggable.
 
 ---
@@ -102,11 +113,43 @@ Multi-hop reasoning and evidence selection happen in vector/graph space; the LLM
 For a fully-local setup, pull a chat model and an embedding model:
 
 ```bash
-ollama pull llama3.2:1b      # OLLAMA_MODEL (chat / extraction)
-ollama pull nomic-embed-text # OLLAMA_EMBED_MODEL (embeddings, field mode)
+brew install ollama && brew services start ollama
+ollama pull qwen2.5:7b       # extraction — recall matters most here
+ollama pull llama3.2:3b      # verbalization and utility roles
+ollama pull nomic-embed-text # embeddings (768-dim, matches the schema)
 ```
 
-> Field mode requires embeddings. `EMBED_PROVIDER` defaults to `openai`, so for a key-free local run set `EMBED_PROVIDER=ollama` (see below).
+### Choosing a model per role
+
+Extraction runs once per chunk; verbalization runs once per query and is the only
+text a human reads. One model cannot be right for both, so each role routes
+independently via `MODEL_<ROLE>` and may even use a different provider.
+
+`pnpm --filter api models:compare` runs the system's own prompts against
+candidates on your hardware. Measured on an Apple M4:
+
+| role | model | median | result |
+|---|---|---|---|
+| extract | qwen2.5:7b | 33.9 s | 7 entities, 3 relationships |
+| extract | llama3.2:3b | 11.9 s | 2 entities, 1 relationship |
+| verbalize | qwen2.5:7b | 4.6 s | grounded |
+| verbalize | llama3.2:3b | 3.6 s | grounded |
+
+This inverts the obvious allocation. The small model is nearly 3× faster at
+extraction and finds a third of the graph — and extraction recall is permanent,
+since a sparse graph cannot be queried and fixing it means re-ingesting
+everything. Verbalizing from evidence that retrieval already found is, by
+comparison, easy. **Pay for extraction; economise on verbalization.**
+
+One caution the router will warn you about: distinct local models are not free to
+mix. Ollama evicts what it cannot hold resident, so a per-role table can be slower
+end-to-end than a uniform one unless `OLLAMA_MAX_LOADED_MODELS` covers them.
+
+> Field mode requires embeddings. `EMBED_PROVIDER` defaults to `openai` **independently of `LLM_PROVIDER`**, so a key-free local run needs *both* `LLM_PROVIDER=ollama` and `EMBED_PROVIDER=ollama`.
+
+`GET /health` returns `503` and names the specific problem when any of these is
+missing — it does not report `ok` while the pipeline is unable to extract
+anything.
 
 ---
 
@@ -117,11 +160,11 @@ git clone <repository-url>
 cd manifold-strata
 pnpm install
 
-# Start PostgreSQL (maps host :5433 → container :5432)
+# Start PostgreSQL + pgvector (maps host :5433 → container :5432)
 docker compose up -d
 
-# Configure env (see the table below), then push the schema
-pnpm db:push
+# Configure env (see the table below), then apply migrations
+pnpm db:migrate
 ```
 
 **`apps/api/.env`** (fully-local example):
@@ -154,21 +197,38 @@ VITE_API_URL=http://localhost:3000
 | `PIPELINE_MODE` | `field` | `field` (geometric, low-LLM) or `legacy` (3-agent LLM) |
 | `LLM_PROVIDER` | `ollama` | `ollama` or `openai` (for chat/extraction) |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server |
-| `OLLAMA_MODEL` | `llama3.2:1b` | Ollama chat model |
+| `OLLAMA_MODEL` | `llama3.2:3b` | Default chat model for any role without its own setting |
+| `MODEL_EXTRACT` … `MODEL_UTILITY` | — | Per-role model, e.g. `qwen2.5:7b` or `openai:gpt-4o-mini`. Roles: `extract`, `resolve`, `validate`, `verbalize`, `summarize`, `utility` |
 | `OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Ollama embedding model |
 | `EMBED_PROVIDER` | `openai` (falls back to `LLM_PROVIDER`) | `ollama` or `openai` for embeddings |
 | `OPENAI_API_KEY` | — | Required if any provider is `openai` |
 | `OPENAI_MODEL` | `gpt-4o-mini` | OpenAI chat model |
 | `OPENAI_EMBED_MODEL` | `text-embedding-3-small` | OpenAI embedding model |
-| `API_KEY` | — | If set, write routes require it (Bearer or `X-API-Key`). Unset = auth disabled |
+| `AUTH_MODE` | — | `required` enforces scoped credentials on every `/api` route. Unset = auth disabled (dev) |
+| `MCP_DOMAINS` | — | Comma-separated domains the MCP server may read. Unset = all |
 | `JOB_CONCURRENCY` | `2` | Concurrent papers in the background worker |
 | `VITE_API_URL` | `http://localhost:3000` | API base URL for the web app |
+| `CORS_ORIGINS` | localhost 5173/5174/3000 | Comma-separated allowed origins |
+| `INSTANCE_ID` | `<hostname>:<port>` | Identity used for job ownership; must differ between concurrent instances |
+| `TRUSTED_PROXY_HOPS` | `0` | Proxies you control in front of the API. `0` ignores `X-Forwarded-For` entirely |
+| `RESOLUTION_CANDIDATE_LIMIT` | `2000` | Existing in-domain nodes entity resolution compares against (logs when hit) |
+| `LLM_UNAVAILABLE_ABORT_AFTER` | `3` | Consecutive unreachable-model chunk failures before abandoning a paper |
+| `MAX_PDF_MB` | `50` | Hard ceiling on a downloaded PDF |
+| `LLM_TIMEOUT_MS` | `120000` | Deadline for one model call |
+| `EMBED_TIMEOUT_MS` | `60000` | Deadline for one embedding call |
+| `PDF_TIMEOUT_MS` | `60000` | Deadline for a PDF download |
+| `METADATA_TIMEOUT_MS` | `45000` | Deadline for the arXiv metadata call (arXiv is genuinely slow) |
+| `JOB_LEASE_TTL_MS` | `120000` | How long a running job's lease stays valid without renewal |
 
 ---
 
 ## Running
 
 ```bash
+# Issue the first admin credential (needs DB access, not HTTP — so the admin
+# routes never have to be left open to bootstrap them):
+pnpm --filter api auth:bootstrap -- --tenant "Acme Research"
+
 pnpm dev          # api (:3000) + web (:5173) in parallel
 # or individually:
 pnpm --filter api dev
@@ -210,18 +270,60 @@ Then open the **Graph Explorer** at http://localhost:5173/explorer — filter by
 
 ## Operational features
 
-- **Background worker + durable jobs** — ingestion/processing run on an in-process bounded-concurrency queue ([apps/api/src/queue](apps/api/src/queue/index.ts)); the request returns `202` immediately. Job status is persisted in a `jobs` table (survives restarts), and any job left mid-run by a crash is recovered to `failed` on startup so nothing hangs forever.
-- **Optional API-key auth** — set `API_KEY` to require a key (`Authorization: Bearer <key>` or `X-API-Key`) on write routes (`POST /api/ingest/*`, `POST /api/papers/*`, mutating `/api/field/*`). Unset for frictionless local dev.
-- **Rate limiting** — in-memory per-IP limits: ingest 10/min, field 30/min, graph & papers 200/min. Responses include `X-RateLimit-*` headers; `429` with `Retry-After` when exceeded.
+- **Background worker + durable jobs** — ingestion/processing run on an in-process bounded-concurrency queue ([apps/api/src/queue](apps/api/src/queue/index.ts)); the request returns `202` immediately. Job status is persisted in a `jobs` table (survives restarts). Each job records the instance that owns it and renews a lease while running, so startup recovery fails **its own** interrupted jobs and jobs whose lease has lapsed — never another live instance's in-flight work.
+- **Failures are loud** — a chunk that fails is counted as failed, not processed; a paper whose chunks all fail is marked `failed` with the reason in `processingError`, never `completed`; a job whose pipeline threw reports `failed`. If the model is unreachable for `LLM_UNAVAILABLE_ABORT_AFTER` consecutive chunks the paper is abandoned immediately rather than re-discovering the outage on every chunk.
+- **Honest health** — `GET /health` checks the database, the chat provider (including whether the configured Ollama model is actually pulled) and the embedding provider, returning `503` and naming the specific misconfiguration. It does not report `ok` while extraction cannot work.
+- **Bounded external calls** — every outbound request (arXiv, PDF, LLM, embeddings) has a deadline, and PDF downloads are streamed under a size cap, so one hung or oversized response cannot permanently consume a worker slot or exhaust memory.
+- **Scoped credentials and per-domain authorization** — `AUTH_MODE=required` makes every `/api` route (reads included) require a key. A credential belongs to a tenant and carries capability scopes (`read`/`write`/`admin`) plus an explicit list of granted domains, so an agent can be handed exactly one field and nothing else. Keys are `mk_<prefix>_<secret>`; only the hash is stored, and they support expiry and revocation. Unset `AUTH_MODE` for frictionless local dev — the startup banner warns loudly, because in that state every request is an anonymous admin.
+- **Audit trail** — every retrieval and every *denial* is recorded with actor, action, domain and outcome, queryable at `GET /api/admin/audit`. Audit writes never block or fail a request.
+- **Rate limiting** — in-memory fixed-window limits keyed on the peer address: ingest 10/min, field 30/min, graph & papers 200/min. `X-Forwarded-For` is honoured **only** for the number of proxy hops you declare via `TRUSTED_PROXY_HOPS`; otherwise it is ignored, so a client cannot mint fresh buckets by rotating the header. Responses include `X-RateLimit-*`; `429` with `Retry-After` when exceeded.
+- **Idempotent reprocessing** — re-running a paper clears its previous edges/sources/propositions first, so a re-run converges instead of duplicating the paper's contribution. Nodes and edges another paper also asserts are preserved.
 - **Open entity & relationship types** — node/edge `type` columns are free-form `text`, not enums. The extractor may discover new types (e.g. `task`, `model`, `loss`, `regularizes`) and they're stored without a migration; the rule validator treats unknown types gracefully (never hard-rejects), and the Explorer's type filter + colors are driven by `GET /api/graph/types` rather than a hardcoded list. `KNOWN_NODE_TYPES`/`KNOWN_EDGE_TYPES` in `packages/shared` are seed defaults only.
+
+## Connectors (any source, one substrate)
+
+A connector turns a source into documents the pipeline can ingest. The contract
+distinguishes two kinds, and the distinction is the point:
+
+| | source | cost |
+|---|---|---|
+| **unstructured** | PDFs, wikis, transcripts | one LLM call per chunk to find the entities |
+| **structured** | OpenAPI documents, database schemas, manifests | **zero LLM calls** — the graph is stated, not inferred |
+
+Both converge on the same extraction shape, so resolution, validation,
+provenance, embedding and retrieval are identical downstream.
+
+```bash
+curl -X POST localhost:3000/api/ingest/connector/openapi \
+  -H 'Content-Type: application/json' \
+  -d '{"domain":"api-surface","url":"https://example.com/openapi.json"}'
+```
+
+Ingesting a four-operation spec produces a typed graph at `llmCalls: 0`:
+
+```
+nodes: endpoint 4 · capability 3 · schema 3 · auth 1
+edges: exposes 4 · belongs_to 4 · returns 4 · accepts 3 · requires 3
+```
+
+which answers structural questions with no model involved at all — *which
+endpoints require `bearerAuth`*, *what does `createUser` accept* — and
+natural-language ones through the same retrieval path as any other domain. That
+is the agent tool-selection problem: with hundreds of connected systems no
+context window holds every schema, so picking the right endpoint is retrieval
+over a typed graph.
+
+*OpenAPI documents must be JSON; YAML needs a parser dependency.*
 
 ## Domains (multi-field isolation)
 
 A single instance can host several research fields without their graphs bleeding into each other. A **domain** is code config ([apps/api/src/domains/](apps/api/src/domains/)) — a `DomainConfig` of preferred entity/relationship types, an extraction-prompt context, examples, and seed papers. Three ship by default: `default` (generic), `gaussian-splatting`, and `nlp`.
 
 How isolation works:
-- Papers are tagged with a `domain`; nodes, edges, and propositions are **stamped** with it.
+- Papers are tagged with a `domain`; nodes, edges, and propositions are **stamped** with it. Only the canonical registry id is ever persisted, so a paper and its extracted entities can never disagree about which domain they are in.
 - Entity resolution only matches within the same domain, so `attention` (NLP) and `attention` (vision) stay separate nodes — **no cross-contamination**.
+- **Unknown domains fail closed.** An unregistered `?domain=` is a `400` naming the valid domains, at every entry point (graph, papers, field, ingest, backfill, MCP). It is never silently treated as the default domain — returning one field's graph to a caller who asked for another's is the exact failure this design exists to prevent.
+- **Traversal never crosses a boundary.** Subgraph, node-detail, and hierarchy views are pinned to the center node's domain, and an edge is only followed when *both* endpoints are in it. A node outside the requested scope returns `404`, not `403`, so these endpoints cannot be used to confirm other domains' entities.
 - Retrieval (`/api/field/query`, MCP tools), graph views, and per-domain hyperbolic/community builds all scope by domain.
 - Types stay *open within* a domain (the extractor can still invent new ones); the domain just supplies the preferred set + prompt context.
 - Legacy data (created before domains) has a `NULL` domain and is treated as `default`, so nothing breaks. Adopt it into a domain with `POST /api/domains/backfill`.
@@ -317,10 +419,18 @@ UUID primary keys; composite indexes on `(source_id, type)` and `(target_id, typ
 All graph read endpoints accept an optional `?domain=` filter; omit it to span every domain.
 
 ### Ingestion
+- `GET /api/ingest/connectors` — available sources, and what each costs in LLM calls
+- `POST /api/ingest/connector/:id` — ingest from any connector *(write scope)*
 - `POST /api/ingest/arxiv` — ingest one paper from arXiv (optional `domain` in body) *(auth)*
 - `POST /api/ingest/bulk` — ingest up to 100 papers (optional `domain`) *(auth)*
 - `GET /api/ingest/status/:jobId` — durable job status
 - `GET /api/ingest/seed/:domain` — curated seed arXiv IDs for a domain
+
+### Admin *(admin scope)*
+- `GET|POST /api/admin/tenants` — tenants
+- `GET|POST /api/admin/principals` — credentials; the key is returned once, on creation
+- `POST /api/admin/principals/:id/revoke` — revoke a credential
+- `GET /api/admin/audit?outcome=&action=&principalId=&limit=` — audit trail
 
 ### Domains
 - `GET /api/domains` — list registered domains
@@ -382,14 +492,73 @@ manifold-strata/
 
 ---
 
+## Testing
+
+```bash
+pnpm typecheck    # api + web
+pnpm test         # 117 unit tests, no services required
+pnpm test:db      # 40 tests against Postgres (isolation, retrieval, failure honesty, job recovery)
+```
+
+### Measuring retrieval
+
+Quality and latency are measured, not asserted. Both harnesses run with
+`EMBED_PROVIDER=local`, a deterministic lexical embedder that needs no model
+server, API key, or network:
+
+```bash
+pnpm --filter api eval                    # recall / nDCG / MRR vs vector and keyword baselines
+pnpm --filter api eval -- --sweep-alpha   # tune PPR restart against measured quality
+pnpm --filter api seed:load -- --nodes 100000
+pnpm --filter api bench:retrieval         # latency A/B against the previous whole-corpus path
+```
+
+On a constructed corpus with known answers:
+
+| | vector | keyword | **field (hybrid)** |
+|---|---|---|---|
+| overall nDCG | 57.4% | 66.7% | **87.7%** |
+| overall recall | 65.0% | 66.7% | **100.0%** |
+| multi-hop recall | 0.0% | 0.0% | **100.0%** |
+| hub nDCG | 75.9% | 100.0% | **100.0%** |
+
+The field pipeline is best or tied-best on every question family. It retrieves the
+gold evidence for **multi-hop questions 100% of the time where both baselines
+retrieve it 0% of the time**, and — since fusion — matches plain keyword search on
+the direct lookups it used to lose. Caveat: this is a *constructed* corpus with a
+lexical embedding space, so it measures retrieval mechanics, not language
+understanding. Numbers, method and remaining gaps: [PLAN.md](PLAN.md) §10.
+
+`test:db` uses a **separate** `knowledge_graph_test` database and is gated on
+`TEST_DATABASE_URL`, so it can never write to a working database:
+
+```bash
+docker exec -it <postgres-container> createdb -U postgres knowledge_graph_test
+DATABASE_URL=postgresql://postgres:postgres@localhost:5433/knowledge_graph_test pnpm db:push
+pnpm test:db
+```
+
+The suite runs on Node's built-in test runner via `tsx` — no test framework
+dependency. The DB suite drives the real Hono app against real Postgres rather
+than mocking the query layer, because the defects worth catching here (a scope
+that widens to the wrong domain, a traversal that crosses a boundary) live in the
+SQL, not above it.
+
 ## Limitations & future work
 
-- **Single-instance worker** — the background queue is in-process with a durable `jobs` table. Multi-instance/horizontal scale wants a shared queue (BullMQ + Redis); the job-table contract is designed so that swap is local to `apps/api/src/queue`.
+> A candid readiness assessment — what would fail a technical buyer's scrutiny, and the phased plan to fix it —
+> lives in **[PLAN.md](PLAN.md)**. The short version: retrieval does not yet scale past demo size, there is no
+> authorization model, and the benchmark measures compression rather than quality.
+
+- **Single-instance worker** — the background queue is in-process with a durable `jobs` table. Jobs are owned by the instance that accepted them and hold a renewed lease, so multiple instances no longer destroy each other's work on startup — but a queued job still only exists in its owner's memory, so it is lost if that process dies before starting it (the lease then lets another instance mark it failed). True horizontal scale wants a shared queue (BullMQ + Redis); the job-table contract is designed so that swap is local to `apps/api/src/queue`.
+- **Rate limiting is per-instance** — the fixed windows are in-memory, so N instances permit N× the configured limit. A shared store is the fix.
+- **Auth is a data boundary, not an authorization boundary** — domains isolate *data*, but a single shared `API_KEY` grants access to all of them, and read routes are unauthenticated. Per-domain permissions need per-user keys/JWT (see below).
 - **Status updates are polled** — the Dashboard/Ingestion pages poll every ~2s. Server-Sent Events would push updates and cut idle DB load.
-- **Vectors in JSONB** — cosine similarity is computed in JS, which is fine at this corpus size (hundreds–thousands of nodes). pgvector + an HNSW index is the path to larger graphs.
+- **Retrieval is fast but not yet proven at millions of entities** — pgvector + HNSW with a bounded working set measures 153 ms p50 / 193 ms p95 on a 100,000-entity corpus (down from 21 s). Latency still grows with corpus size through buffer-cache pressure; `halfvec`, a lower `hnsw.ef_search`, and fewer dimensions are the next levers. Reproduce with `pnpm --filter api seed:load` and `bench:retrieval`.
+- **Entity resolution has not moved to the index yet** — it still compares in JS against the `RESOLUTION_CANDIDATE_LIMIT` (2000) most recent in-domain nodes, and logs when it hits the cap.
 - **Domains are strictly isolated, with no cross-domain bridges** — each node lives in exactly one domain (see [Domains](#domains-multi-field-isolation)), so a concept studied in two fields becomes two nodes. A future "shared" namespace or a `domains text[]` tag could link them where it's genuinely the same entity. Domains are also config-as-code; a DB-editable registry + per-domain type-compatibility rules are natural extensions.
 - **Hyperbolic/community layers are batch** — `train-hyperbolic` and `communities/build` are run on demand, not incrementally maintained as papers arrive.
-- **Auth is a single shared key** — fine for a protected deployment; real multi-tenant use wants per-user keys / JWT and scoped permissions.
+- **Auth is a single shared key** — fine for a protected deployment; real multi-tenant use wants per-user keys / JWT and scoped permissions, with domain membership enforced per principal rather than only per query.
 
 ---
 

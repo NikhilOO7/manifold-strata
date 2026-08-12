@@ -1,31 +1,49 @@
 import { Hono } from 'hono';
 import { db } from '../db';
 import { papers } from '../db/schema';
-import { eq, desc, inArray } from 'drizzle-orm';
-import { processPaper } from '../pipeline/processor';
+import { eq, desc, inArray, sql } from 'drizzle-orm';
+import { processPaper, reprocessPaper } from '../pipeline/processor';
 import { paperQueue, createJob, setJobStatus } from '../queue';
+import { domainWhere } from '../domains/filter';
+import { requireDomain, requireScopeOn } from '../middleware/auth';
+import { routeError, isUuid } from './errors';
 
 export const papersRouter = new Hono();
 
+function pageParams(c: { req: { query: (k: string) => string | undefined } }) {
+  const rawLimit = parseInt(c.req.query('limit') || '20', 10);
+  const rawOffset = parseInt(c.req.query('offset') || '0', 10);
+  return {
+    limit: Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 200) : 20,
+    offset: Number.isFinite(rawOffset) ? Math.max(rawOffset, 0) : 0,
+  };
+}
+
 papersRouter.get('/', async (c) => {
   try {
-    const limit = parseInt(c.req.query('limit') || '20');
-    const offset = parseInt(c.req.query('offset') || '0');
+    const { limit, offset } = pageParams(c);
+    const rawDomain = c.req.query('domain');
+    const where = rawDomain ? domainWhere(papers.domain, requireDomain(c, rawDomain, 'papers.read').id) : undefined;
 
     const allPapers = await db
       .select()
       .from(papers)
+      .where(where)
       .orderBy(desc(papers.createdAt))
       .limit(limit)
       .offset(offset);
 
+    const [{ count }] = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(papers)
+      .where(where);
+
     return c.json({
       papers: allPapers,
-      pagination: { limit, offset },
+      pagination: { limit, offset, total: count ?? 0 },
     });
   } catch (error) {
-    console.error('Error fetching papers:', error);
-    return c.json({ error: 'Failed to fetch papers' }, 500);
+    return routeError(c, error, 'Failed to fetch papers');
   }
 });
 
@@ -42,47 +60,48 @@ papersRouter.get('/processing', async (c) => {
           'chunking',
           'extracting_entities',
           'resolving_entities',
-          'validating'
+          'validating',
         ])
       )
       .orderBy(desc(papers.createdAt));
 
     return c.json({ papers: processingPapers });
   } catch (error) {
-    console.error('Error fetching processing papers:', error);
-    return c.json({ error: 'Failed to fetch processing papers' }, 500);
+    return routeError(c, error, 'Failed to fetch processing papers');
   }
 });
 
 papersRouter.get('/:id', async (c) => {
   try {
     const id = c.req.param('id');
+    if (!isUuid(id)) return c.json({ error: 'Paper not found' }, 404);
 
-    const paper = await db
-      .select()
-      .from(papers)
-      .where(eq(papers.id, id))
-      .limit(1);
-
-    if (!paper.length) {
+    const [paper] = await db.select().from(papers).where(eq(papers.id, id)).limit(1);
+    if (!paper) {
       return c.json({ error: 'Paper not found' }, 404);
     }
-
-    return c.json(paper[0]);
+    return c.json(paper);
   } catch (error) {
-    console.error('Error fetching paper:', error);
-    return c.json({ error: 'Failed to fetch paper' }, 500);
+    return routeError(c, error, 'Failed to fetch paper');
   }
 });
 
 papersRouter.post('/', async (c) => {
   try {
-    const body = await c.req.json();
-    const { title, abstract, arxivId, doi, pdfUrl, publicationDate, venue, rawText, domain } = body;
+    const body = await c.req.json().catch(() => ({}));
+    const { title, abstract, arxivId, doi, pdfUrl, publicationDate, venue, rawText, domain } =
+      body ?? {};
 
-    if (!title) {
+    requireScopeOn(c, 'write', 'papers.create');
+
+    if (!title || typeof title !== 'string' || !title.trim()) {
       return c.json({ error: 'Title is required' }, 400);
     }
+
+    // Same strictness as /api/ingest: an unregistered domain string stored here
+    // would be re-read by the processor and rejected there instead, after the row
+    // already existed.
+    const resolvedDomain = requireDomain(c, domain, 'papers.read').id;
 
     const [newPaper] = await db
       .insert(papers)
@@ -95,66 +114,70 @@ papersRouter.post('/', async (c) => {
         publicationDate,
         venue,
         rawText,
-        domain: domain || null,
+        domain: resolvedDomain,
       })
       .returning();
 
     return c.json(newPaper, 201);
   } catch (error) {
-    console.error('Error creating paper:', error);
-    return c.json({ error: 'Failed to create paper' }, 500);
+    return routeError(c, error, 'Failed to create paper');
   }
 });
 
 papersRouter.post('/:id/process', async (c) => {
   try {
+    requireScopeOn(c, 'write', 'papers.process');
+
     const id = c.req.param('id');
+    if (!isUuid(id)) return c.json({ error: 'Paper not found' }, 404);
 
-    const [paper] = await db
-      .select()
-      .from(papers)
-      .where(eq(papers.id, id))
-      .limit(1);
-
+    const [paper] = await db.select().from(papers).where(eq(papers.id, id)).limit(1);
     if (!paper) {
       return c.json({ error: 'Paper not found' }, 404);
     }
 
     if (!paper.rawText) {
-      return c.json({ 
-        error: 'Paper has no text content. Please ingest the PDF first.',
-        paperId: id 
-      }, 400);
+      return c.json(
+        { error: 'Paper has no text content. Please ingest the PDF first.', paperId: id },
+        400
+      );
     }
 
-    // Allow reprocessing if paper previously failed (no entities created)
-    if (paper.processed) {
-      console.log(`Paper already marked as processed. Allowing reprocessing...`);
-    }
+    // A paper that already contributed to the graph is *re*processed: its previous
+    // edges/sources/propositions are cleared first. Running the plain path twice
+    // duplicated every one of them, which silently doubled the paper's weight in
+    // PPR and repeated its evidence in every retrieval.
+    const alreadyContributed = paper.processed || paper.processingStatus === 'completed';
 
-    console.log(`Starting processing for paper: ${paper.title}`);
+    console.log(
+      `${alreadyContributed ? 'Reprocessing' : 'Starting processing for'} paper: ${paper.title}`
+    );
 
-    // Reset paper status before processing
     await db
       .update(papers)
       .set({
         processed: false,
         processingStatus: 'pending',
-        processingProgress: 0
+        processingProgress: 0,
+        processingError: null,
       })
       .where(eq(papers.id, id));
 
-    // Enqueue on the background worker instead of blocking the request for
-    // minutes. Progress is observable via /api/papers/processing and the job
-    // status endpoint.
-    const jobId = `job-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+    const jobId = `job-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     await createJob(jobId, 'process', { status: 'queued', paperId: id });
 
-    paperQueue.enqueue(async () => {
+    paperQueue.enqueue(jobId, async () => {
       try {
         await setJobStatus(jobId, { status: 'processing', paperId: id });
-        await processPaper(id);
-        await setJobStatus(jobId, { status: 'completed', paperId: id });
+        const stats = alreadyContributed ? await reprocessPaper(id) : await processPaper(id);
+        await setJobStatus(jobId, {
+          status: 'completed',
+          paperId: id,
+          progress:
+            `Processed ${stats.chunksProcessed} chunk(s): ` +
+            `${stats.entitiesCreated} entities, ${stats.relationshipsCreated} relationships` +
+            (stats.chunksFailed > 0 ? `, ${stats.chunksFailed} chunk(s) failed` : ''),
+        });
       } catch (err) {
         console.error('Error in processing pipeline:', err);
         await setJobStatus(jobId, {
@@ -165,17 +188,16 @@ papersRouter.post('/:id/process', async (c) => {
       }
     });
 
-    return c.json({
-      message: 'Processing started',
-      paperId: id,
-      jobId,
-      status: 'queued'
-    }, 202);
+    return c.json(
+      {
+        message: alreadyContributed ? 'Reprocessing started' : 'Processing started',
+        paperId: id,
+        jobId,
+        status: 'queued',
+      },
+      202
+    );
   } catch (error) {
-    console.error('Error processing paper:', error);
-    return c.json({ 
-      error: 'Failed to process paper',
-      details: error instanceof Error ? error.message : 'Unknown error'
-    }, 500);
+    return routeError(c, error, 'Failed to process paper');
   }
 });

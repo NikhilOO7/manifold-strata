@@ -1,0 +1,17 @@
+{
+  // Workspace anchor. Holds no files of its own — each package keeps its own
+  // compiler options (the API targets Node, the web app targets the browser).
+  //
+  // Its job is to give editors a single project root for the monorepo. Without a
+  // tsconfig at the repository root, the TypeScript language server has no
+  // anchor above apps/*, and files that sit outside a package's `include` (or are
+  // opened before the server has resolved the nearest config) fall back to a
+  // default project with no `types` — which is what surfaced `process`,
+  // `console`, and `node:*` as unresolved in the editor while `tsc` was happy.
+  "files": [],
+  "references": [
+    { "path": "./apps/api" },
+    { "path": "./apps/web" },
+    { "path": "./packages/shared" }
+  ]
+}

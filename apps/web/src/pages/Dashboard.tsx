@@ -1,10 +1,13 @@
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useMutation, useQueryClient, useIsFetching } from '@tanstack/react-query';
 import { api } from '../lib/api';
 import { useState } from 'react';
 
 export default function Dashboard() {
   const queryClient = useQueryClient();
   const [processingPaperId, setProcessingPaperId] = useState<string | null>(null);
+  // Any query on this page currently hitting the network — drives the refresh
+  // button's spinner so feedback lasts exactly as long as the work does.
+  const isRefreshing = useIsFetching() > 0;
 
   const { data: stats, isLoading } = useQuery({
     queryKey: ['graph-stats'],
@@ -19,7 +22,21 @@ export default function Dashboard() {
   const { data: processingPapers } = useQuery({
     queryKey: ['processing-papers'],
     queryFn: () => api.papers.processing(),
-    refetchInterval: 2000,
+    /**
+     * Poll fast only while something is actually processing.
+     *
+     * This was a flat 2s regardless of state, so an open dashboard sent roughly
+     * 43,000 requests a day asking whether a usually-empty list had changed. The
+     * cost is not just noise in the log: it is a query against the papers table
+     * every two seconds forever, and on the API side those requests share a rate
+     * limit with real work.
+     *
+     * Idle still polls, just slowly — a paper can start processing from the
+     * ingestion page or another client, and the dashboard should notice within a
+     * reasonable time rather than needing a refresh.
+     */
+    refetchInterval: (query) =>
+      (query.state.data?.papers?.length ?? 0) > 0 ? 2000 : 30000,
   });
 
   const processMutation = useMutation({
@@ -66,16 +83,26 @@ export default function Dashboard() {
         <div className="flex items-center space-x-3">
           <button
             onClick={() => {
+              // The button always "worked" — invalidation does refetch — but a
+              // fast refetch is indistinguishable from a dead button without
+              // feedback. The spinner below is driven by the real in-flight
+              // state, so it shows exactly as long as the network does.
               queryClient.invalidateQueries({ queryKey: ['graph-stats'] });
               queryClient.invalidateQueries({ queryKey: ['papers'] });
               queryClient.invalidateQueries({ queryKey: ['processing-papers'] });
             }}
-            className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-200 rounded-lg hover:bg-gray-50 hover:border-gray-300 transition-all duration-200 flex items-center space-x-2"
+            disabled={isRefreshing}
+            className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-200 rounded-lg hover:bg-gray-50 hover:border-gray-300 transition-all duration-200 flex items-center space-x-2 disabled:opacity-60 disabled:cursor-wait"
           >
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <svg
+              className={`w-4 h-4 ${isRefreshing ? 'animate-spin text-blue-600' : ''}`}
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
             </svg>
-            <span>Refresh</span>
+            <span>{isRefreshing ? 'Refreshing…' : 'Refresh'}</span>
           </button>
         </div>
       </div>

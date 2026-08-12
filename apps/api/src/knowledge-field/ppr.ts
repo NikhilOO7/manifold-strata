@@ -20,6 +20,32 @@ export interface PPROptions {
 }
 
 /**
+ * Restart probability.
+ *
+ * 0.15, chosen by measurement (`pnpm --filter api eval -- --sweep-alpha`).
+ *
+ * This value was briefly raised to 0.5 on a reasonable-sounding argument: on an
+ * undirected graph the walk component drifts toward a degree-proportional
+ * distribution, and on a star graph the seed scored 0.18 against a 12-neighbour
+ * hub's 0.46 — the node that matched the question ranking below a generic hub.
+ * Raising restart fixed that node-level ordering.
+ *
+ * It did not improve retrieval, which is the thing we actually care about. On the
+ * evaluation corpus, multi-hop nDCG fell from 63.1% at alpha=0.15 to 30.1% at
+ * 0.5, while the hub family scored an identical 31.6% at *every* alpha tested.
+ * Node-level hub dominance turns out not to propagate to evidence: the relevant
+ * spoke still enters the top-ranked nodes, and its proposition is still gathered.
+ * Meanwhile high restart keeps mass on the seed, which is precisely what starves
+ * the distant answer a multi-hop question is asking for.
+ *
+ * The lesson is in the file for the next person tempted by the same argument:
+ * this was optimising a proxy (seed rank vs hub rank) that did not map to the
+ * outcome (was the right evidence retrieved, and ranked highly). Change it with
+ * a sweep, not with reasoning.
+ */
+const DEFAULT_ALPHA = 0.15;
+
+/**
  * @param nodeIds  all node ids in the graph
  * @param edges    weighted edges (treated as undirected for propagation)
  * @param seeds    seed nodeId -> restart weight (need not be normalized)
@@ -31,7 +57,7 @@ export function personalizedPageRank(
   seeds: Map<string, number>,
   opts: PPROptions = {}
 ): Map<string, number> {
-  const alpha = opts.alpha ?? 0.15;
+  const alpha = opts.alpha ?? DEFAULT_ALPHA;
   const iterations = opts.iterations ?? 30;
   const n = nodeIds.length;
   if (n === 0) return new Map();

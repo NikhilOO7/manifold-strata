@@ -2,13 +2,17 @@ import { Hono } from 'hono';
 import { db } from '../db';
 import { nodes, edges, nodeVectors, propositions } from '../db/schema';
 import { eq, inArray, isNull, isNotNull, and } from 'drizzle-orm';
-import { getDomain } from '../domains';
+import { resolveStoredDomain } from '../domains';
 import { domainWhere } from '../domains/filter';
-import { embed, embedOne, embedModel, cosine } from '../services/embeddings';
+import { embed, embedOne, embedModel, embedSpaceId, cosine } from '../services/embeddings';
 import { retrieveField, fieldQuery } from '../knowledge-field/retrieve';
 import { trainPoincare, hierarchyNeighbors } from '../knowledge-field/hyperbolic';
 import { buildCommunities } from '../knowledge-field/communities';
 import * as metrics from '../services/metrics';
+import { requireDomain, requireScopeOn } from '../middleware/auth';
+import { recordAudit, auditText } from '../auth/audit';
+import { principalOf } from '../middleware/auth';
+import { routeError, isUuid } from './errors';
 
 export const fieldRouter = new Hono();
 
@@ -21,7 +25,15 @@ function chunk<T>(arr: T[], size: number): T[][] {
 // --- Backfill embeddings for existing nodes + propositions ------------------
 fieldRouter.post('/backfill', async (c) => {
   try {
-    const allNodes = await db.select().from(nodes);
+    requireScopeOn(c, 'write', 'field.backfill');
+    const body = await c.req.json().catch(() => ({}));
+    // Optional scope: backfilling one domain at a time keeps the embedding spend
+    // predictable on a large corpus.
+    const scope = body?.domain ? requireDomain(c, body.domain, 'field.read').id : null;
+    const nodeScope = scope ? domainWhere(nodes.domain, scope) : undefined;
+    const propScope = scope ? domainWhere(propositions.domain, scope) : undefined;
+
+    const allNodes = await db.select().from(nodes).where(nodeScope);
     const vecRows = await db.select({ nodeId: nodeVectors.nodeId }).from(nodeVectors);
     const haveVec = new Set(vecRows.map((v) => v.nodeId));
     const missing = allNodes.filter((n) => !haveVec.has(n.id));
@@ -30,45 +42,75 @@ fieldRouter.post('/backfill', async (c) => {
     for (const batch of chunk(missing, 100)) {
       const texts = batch.map((n) => `${n.name}${n.description ? '. ' + n.description : ''}`);
       const vectors = await embed(texts, 'backfill-node');
-      await db.insert(nodeVectors).values(
-        batch.map((n, i) => ({ nodeId: n.id, embedding: vectors[i], model: embedModel() }))
-      ).onConflictDoNothing();
+      await db
+        .insert(nodeVectors)
+        .values(
+          batch.map((n, i) => ({
+            nodeId: n.id,
+            embeddingVec: vectors[i],
+            model: embedModel(),
+            space: embedSpaceId(),
+          }))
+        )
+        .onConflictDoNothing();
       nodesEmbedded += batch.length;
     }
 
     // Propositions missing embeddings.
-    const propMissing = await db.select().from(propositions).where(isNull(propositions.embedding));
+    const propMissing = await db
+      .select()
+      .from(propositions)
+      .where(
+        propScope
+          ? and(isNull(propositions.embeddingVec), propScope)
+          : isNull(propositions.embeddingVec)
+      );
+
     let propsEmbedded = 0;
     for (const batch of chunk(propMissing, 100)) {
       const vectors = await embed(batch.map((p) => p.text), 'backfill-prop');
       for (let i = 0; i < batch.length; i++) {
-        await db.update(propositions).set({ embedding: vectors[i] }).where(eq(propositions.id, batch[i].id));
+        await db
+          .update(propositions)
+          .set({ embeddingVec: vectors[i], space: embedSpaceId() })
+          .where(eq(propositions.id, batch[i].id));
       }
       propsEmbedded += batch.length;
     }
 
-    return c.json({ nodesEmbedded, propsEmbedded, model: embedModel() });
+    return c.json({
+      domain: scope ?? 'all',
+      nodesEmbedded,
+      propsEmbedded,
+      model: embedModel(),
+      space: embedSpaceId(),
+    });
   } catch (error) {
-    console.error('Backfill error:', error);
-    return c.json({ error: 'Backfill failed', message: String(error) }, 500);
+    return routeError(c, error, 'Backfill failed');
   }
 });
 
 // --- Train hyperbolic (Poincaré) coordinates --------------------------------
 fieldRouter.post('/train-hyperbolic', async (c) => {
   try {
+    requireScopeOn(c, 'write', 'field.trainHyperbolic');
     const body = await c.req.json().catch(() => ({}));
-    const domain = getDomain(body?.domain);
+    const domain = requireDomain(c, body?.domain, 'field.read');
     const hierTypes = domain.hierarchicalEdgeTypes ?? ['extends', 'improves', 'cites'];
 
     const allNodes = await db.select().from(nodes).where(domainWhere(nodes.domain, domain.id));
     const hierEdges = await db
       .select({ sourceId: edges.sourceId, targetId: edges.targetId })
       .from(edges)
-      .where(and(domainWhere(edges.domain, domain.id), inArray(edges.type, hierTypes as any)));
+      .where(and(domainWhere(edges.domain, domain.id), inArray(edges.type, hierTypes)));
 
     if (hierEdges.length === 0) {
-      return c.json({ error: `No hierarchical edges (${hierTypes.join('/')}) to train on for domain "${domain.id}"` }, 400);
+      return c.json(
+        {
+          error: `No hierarchical edges (${hierTypes.join('/')}) to train on for domain "${domain.id}"`,
+        },
+        400
+      );
     }
 
     const coords = trainPoincare(
@@ -87,10 +129,14 @@ fieldRouter.post('/train-hyperbolic', async (c) => {
       if (res.length > 0) updated += 1;
     }
 
-    return c.json({ trainedNodes: coords.size, edgesUsed: hierEdges.length, persisted: updated });
+    return c.json({
+      domain: domain.id,
+      trainedNodes: coords.size,
+      edgesUsed: hierEdges.length,
+      persisted: updated,
+    });
   } catch (error) {
-    console.error('Hyperbolic training error:', error);
-    return c.json({ error: 'Training failed', message: String(error) }, 500);
+    return routeError(c, error, 'Training failed');
   }
 });
 
@@ -98,13 +144,45 @@ fieldRouter.post('/train-hyperbolic', async (c) => {
 fieldRouter.get('/hierarchy/:nodeId', async (c) => {
   try {
     const nodeId = c.req.param('nodeId');
-    const rows = await db
-      .select({ nodeId: nodeVectors.nodeId, hyperbolic: nodeVectors.hyperbolic })
-      .from(nodeVectors)
-      .where(isNotNull(nodeVectors.hyperbolic));
+    const requestedDomain = c.req.query('domain');
+    const requestedScope = requestedDomain ? requireDomain(c, requestedDomain, 'field.read').id : null;
+
+    if (!isUuid(nodeId)) return c.json({ error: 'Node not found' }, 404);
+
+    const [node] = await db.select().from(nodes).where(eq(nodes.id, nodeId)).limit(1);
+    if (!node) {
+      return c.json({ error: 'Node not found' }, 404);
+    }
+
+    const nodeDomain = resolveStoredDomain(node.domain, `node ${node.id}`).id;
+    if (requestedScope && requestedScope !== nodeDomain) {
+      return c.json({ error: 'Node not found' }, 404);
+    }
+
+    // Hierarchy is only meaningful inside one domain — Poincaré coordinates are
+    // trained per domain, so mixing them compares positions from unrelated
+    // embeddings. This previously loaded every node in the database and happily
+    // returned another field's entities as "generalizations".
+    const domainNodes = await db
+      .select({ id: nodes.id, name: nodes.name, type: nodes.type })
+      .from(nodes)
+      .where(domainWhere(nodes.domain, nodeDomain));
+    const inDomain = new Set(domainNodes.map((n) => n.id));
+
+    const rows = (
+      await db
+        .select({ nodeId: nodeVectors.nodeId, hyperbolic: nodeVectors.hyperbolic })
+        .from(nodeVectors)
+        .where(isNotNull(nodeVectors.hyperbolic))
+    ).filter((r) => inDomain.has(r.nodeId));
 
     if (rows.length === 0) {
-      return c.json({ error: 'No hyperbolic coords yet — run POST /api/field/train-hyperbolic' }, 400);
+      return c.json(
+        {
+          error: `No hyperbolic coords for domain "${nodeDomain}" — run POST /api/field/train-hyperbolic`,
+        },
+        400
+      );
     }
 
     const coords = new Map<string, number[]>();
@@ -112,31 +190,31 @@ fieldRouter.get('/hierarchy/:nodeId', async (c) => {
 
     const { generalizations, specializations } = hierarchyNeighbors(nodeId, coords, 8);
 
-    const allNodes = await db.select({ id: nodes.id, name: nodes.name, type: nodes.type }).from(nodes);
-    const meta = new Map(allNodes.map((n) => [n.id, n]));
+    const meta = new Map(domainNodes.map((n) => [n.id, n]));
     const decorate = (arr: { id: string; distance: number; norm: number }[]) =>
       arr.map((x) => ({ ...x, name: meta.get(x.id)?.name, type: meta.get(x.id)?.type }));
 
     return c.json({
       node: meta.get(nodeId) ?? { id: nodeId },
+      domain: nodeDomain,
       generalizations: decorate(generalizations),
       specializations: decorate(specializations),
     });
   } catch (error) {
-    console.error('Hierarchy error:', error);
-    return c.json({ error: 'Hierarchy lookup failed', message: String(error) }, 500);
+    return routeError(c, error, 'Hierarchy lookup failed');
   }
 });
 
 // --- Build community summaries ----------------------------------------------
 fieldRouter.post('/communities/build', async (c) => {
   try {
+    requireScopeOn(c, 'write', 'field.communities');
     const body = await c.req.json().catch(() => ({}));
-    const result = await buildCommunities(body?.domain);
-    return c.json(result);
+    const domain = requireDomain(c, body?.domain, 'field.read');
+    const result = await buildCommunities(domain.id);
+    return c.json({ domain: domain.id, ...result });
   } catch (error) {
-    console.error('Communities error:', error);
-    return c.json({ error: 'Community build failed', message: String(error) }, 500);
+    return routeError(c, error, 'Community build failed');
   }
 });
 
@@ -145,25 +223,56 @@ fieldRouter.get('/retrieve', async (c) => {
   try {
     const q = c.req.query('q');
     if (!q) return c.json({ error: 'q query param required' }, 400);
-    const domain = c.req.query('domain') || undefined;
+
+    // Resolved here so an unregistered domain is a 400 naming the valid ones,
+    // rather than a 200 carrying the default domain's evidence.
+    const domain = requireDomain(c, c.req.query('domain'), 'field.retrieve').id;
     const result = await retrieveField(q, { domain });
-    return c.json(result);
+
+    // Every retrieval is recorded: what was asked, in which domain, and how much
+    // evidence came back. This is the record that answers "what did this agent
+    // see" after the fact.
+    recordAudit({
+      principal: principalOf(c),
+      action: 'field.retrieve',
+      domain,
+      outcome: 'allowed',
+      detail: { question: auditText(q), evidenceCount: result.evidence.length },
+    });
+
+    return c.json({ domain, ...result });
   } catch (error) {
-    console.error('Retrieve error:', error);
-    return c.json({ error: 'Retrieve failed', message: String(error) }, 500);
+    return routeError(c, error, 'Retrieve failed');
   }
 });
 
 // --- Full query (PPR + compression + 1 verbalize call) ----------------------
 fieldRouter.post('/query', async (c) => {
   try {
-    const body = await c.req.json();
-    const question = body.question;
-    if (!question) return c.json({ error: 'question is required' }, 400);
+    const body = await c.req.json().catch(() => ({}));
+    const question = body?.question;
+    if (!question || typeof question !== 'string' || !question.trim()) {
+      return c.json({ error: 'question is required' }, 400);
+    }
 
-    const result = await fieldQuery(question, { verbalize: body.verbalize, domain: body.domain });
+    const domain = requireDomain(c, body?.domain, 'field.query').id;
+    const result = await fieldQuery(question, { verbalize: body?.verbalize, domain });
+
+    recordAudit({
+      principal: principalOf(c),
+      action: 'field.query',
+      domain,
+      outcome: 'allowed',
+      detail: {
+        question: auditText(question),
+        evidenceCount: result.evidence.length,
+        llmCalls: result.llmCalls,
+      },
+    });
+
     return c.json({
       question,
+      domain,
       answer: result.answer,
       llmCalls: result.llmCalls,
       evidenceCount: result.evidence.length,
@@ -173,19 +282,19 @@ fieldRouter.post('/query', async (c) => {
       evidence: result.evidence,
     });
   } catch (error) {
-    console.error('Query error:', error);
-    return c.json({ error: 'Query failed', message: String(error) }, 500);
+    return routeError(c, error, 'Query failed');
   }
 });
 
 // --- Benchmark: prove the LLM-call / token reduction ------------------------
 fieldRouter.get('/benchmark', async (c) => {
   try {
-    const reset = c.req.query('reset');
-    if (reset) {
+    if (c.req.query('reset')) {
       metrics.reset();
       return c.json({ message: 'metrics reset' });
     }
+
+    const domain = requireDomain(c, c.req.query('domain'), 'field.read').id;
 
     // (a) Ingestion: accumulated metrics per pipeline mode (populate by
     //     processing papers under PIPELINE_MODE=legacy then =field).
@@ -201,12 +310,15 @@ fieldRouter.get('/benchmark', async (c) => {
       'Which methods extend 3D Gaussian Splatting?',
     ];
     const qParam = c.req.query('questions');
-    const questions = qParam ? qParam.split('|') : defaultQuestions;
+    const questions = qParam ? qParam.split('|').filter((q) => q.trim()) : defaultQuestions;
 
+    // Both arms read the same domain-scoped corpus — comparing a domain-scoped
+    // field retrieval against a whole-database naive baseline would flatter the
+    // field arm for the wrong reason.
     const propRows = await db
       .select()
       .from(propositions)
-      .where(isNotNull(propositions.embedding));
+      .where(and(isNotNull(propositions.embeddingVec), domainWhere(propositions.domain, domain)));
 
     const retrieval = [];
     for (const question of questions) {
@@ -214,13 +326,13 @@ fieldRouter.get('/benchmark', async (c) => {
 
       // Naive RAG: top-10 propositions by pure cosine, full text, no compression.
       const naive = propRows
-        .map((p) => ({ text: p.text, score: cosine(qvec, p.embedding as number[]) }))
+        .map((p) => ({ text: p.text, score: cosine(qvec, p.embeddingVec as number[]) }))
         .sort((a, b) => b.score - a.score)
         .slice(0, 10);
       const naiveChars = naive.reduce((s, x) => s + x.text.length, 0);
 
       // Field: PPR + MMR-compressed evidence (no verbalize call for the benchmark).
-      const field = await retrieveField(question);
+      const field = await retrieveField(question, { domain });
 
       retrieval.push({
         question,
@@ -235,11 +347,11 @@ fieldRouter.get('/benchmark', async (c) => {
       note:
         'Ingestion metrics accumulate as papers are processed. Process the same ' +
         'paper under PIPELINE_MODE=legacy and PIPELINE_MODE=field to compare LLM calls.',
+      domain,
       ingestion,
       retrieval,
     });
   } catch (error) {
-    console.error('Benchmark error:', error);
-    return c.json({ error: 'Benchmark failed', message: String(error) }, 500);
+    return routeError(c, error, 'Benchmark failed');
   }
 });

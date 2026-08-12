@@ -2,12 +2,33 @@ version: '3.8'
 
 services:
   postgres:
-    image: postgres:16
-    container_name: gsplat-kg-db
+    # pgvector's image is postgres:16 plus the `vector` extension. Retrieval uses
+    # an HNSW index for nearest-neighbour search; without the extension the API
+    # refuses to start rather than silently falling back to a full table scan.
+    image: pgvector/pgvector:pg16
+    container_name: manifold-db
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: knowledge_graph
+    # The HNSW indexes have to stay in the buffer cache to give consistent ANN
+    # latency. Postgres ships with shared_buffers=128MB, which a vector index
+    # outgrows almost immediately — measured as a 1.8x p50 regression when the
+    # corpus doubled, purely from cache eviction. Size this to your index, not
+    # your row count.
+    # Docker gives a container 64MB of /dev/shm by default. Postgres uses shared
+    # memory for parallel workers, so maintenance (VACUUM FULL, REINDEX, index
+    # builds) fails with "could not resize shared memory segment" long before it
+    # runs out of disk.
+    shm_size: 1gb
+    command:
+      - postgres
+      - -c
+      - shared_buffers=1GB
+      - -c
+      - effective_cache_size=3GB
+      - -c
+      - maintenance_work_mem=512MB
     ports:
       - "5433:5432"
     volumes:

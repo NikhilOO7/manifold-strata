@@ -11,6 +11,9 @@ export default function Explorer() {
   const [nodeTypeFilter, setNodeTypeFilter] = useState<string>('');
   const [minConfidence, setMinConfidence] = useState(0);
   const [nodeLimit, setNodeLimit] = useState(100);
+  // Isolated nodes are hidden by default: in a relationship explorer a node with
+  // no edges is occupied space, not information.
+  const [showIsolated, setShowIsolated] = useState(false);
   const [domainFilter, setDomainFilter] = useState('');
 
   const { data: domainsData } = useQuery({
@@ -66,7 +69,7 @@ export default function Explorer() {
 
   // Build flow nodes/edges: filter edges by confidence and to the currently
   // loaded node set, then run a force-directed layout so related nodes cluster.
-  const { flowNodes, flowEdges, totalEdges } = useMemo(() => {
+  const { flowNodes, flowEdges, totalEdges, isolatedCount } = useMemo(() => {
     const rawNodes = nodesData?.nodes ?? [];
     const rawEdges = edgesData?.edges ?? [];
     const visibleIds = new Set(rawNodes.map((n) => n.id));
@@ -78,41 +81,88 @@ export default function Explorer() {
         parseFloat(e.confidence ?? '0') >= minConfidence
     );
 
+    // Degree drives both what is shown and how it is drawn. A graph explorer is
+    // about relationships, so a node with no surviving edge contributes nothing
+    // but occupied space — and at the default settings those were the majority
+    // of what was on screen (100 nodes carrying 45 edges).
+    const degree = new Map<string, number>();
+    for (const id of visibleIds) degree.set(id, 0);
+    for (const e of keptEdges) {
+      degree.set(e.sourceId, (degree.get(e.sourceId) ?? 0) + 1);
+      degree.set(e.targetId, (degree.get(e.targetId) ?? 0) + 1);
+    }
+
+    const connected = rawNodes.filter((n) => (degree.get(n.id) ?? 0) > 0);
+    const isolatedCount = rawNodes.length - connected.length;
+    const shown = showIsolated ? rawNodes : connected;
+
+    // Give the simulation room proportional to what it has to place; a fixed
+    // canvas is what forced everything into an overlapping ball.
+    const span = Math.max(1200, Math.ceil(Math.sqrt(Math.max(shown.length, 1)) * 260));
     const positions = computeForceLayout(
-      rawNodes.map((n) => ({ id: n.id })),
-      keptEdges.map((e) => ({ source: e.sourceId, target: e.targetId }))
+      shown.map((n) => ({ id: n.id })),
+      keptEdges.map((e) => ({ source: e.sourceId, target: e.targetId })),
+      { width: span, height: Math.round(span * 0.7), iterations: 420 }
     );
 
-    const flowNodes = rawNodes.map((node) => ({
-      id: node.id,
-      data: { label: node.name },
-      position: positions.get(node.id) ?? { x: 0, y: 0 },
-      style: {
-        background: getNodeColor(node.type),
-        color: '#fff',
-        padding: 10,
-        borderRadius: 8,
-        fontSize: 12,
-        fontWeight: 600,
-        border: '2px solid rgba(255,255,255,0.2)',
-        boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)',
-        minWidth: 120,
-        textAlign: 'center' as const,
-      },
-    }));
+    const maxDegree = Math.max(1, ...shown.map((n) => degree.get(n.id) ?? 0));
 
-    const flowEdges = keptEdges.map((edge) => ({
-      id: edge.id,
-      source: edge.sourceId,
-      target: edge.targetId,
-      label: edge.type,
-      type: 'smoothstep',
-      style: { stroke: '#9ca3af', strokeWidth: 2 },
-      labelStyle: { fill: '#6b7280', fontWeight: 600, fontSize: 12 },
-    }));
+    const flowNodes = shown.map((node) => {
+      const d = degree.get(node.id) ?? 0;
+      // Scale with the square root so a hub reads as a hub without a single
+      // very-high-degree node dwarfing everything else.
+      const weight = Math.sqrt(d / maxDegree);
+      const fontSize = 10 + Math.round(weight * 5);
+      const minWidth = 96 + Math.round(weight * 84);
+      // Long labels are usually extraction artefacts (sentence fragments stored
+      // as entities). Truncate for the canvas; the full text is one click away
+      // in the details panel, and native title text covers hover.
+      const label = node.name.length > 30 ? `${node.name.slice(0, 29)}…` : node.name;
 
-    return { flowNodes, flowEdges, totalEdges: rawEdges.length };
-  }, [nodesData, edgesData, minConfidence]);
+      return {
+        id: node.id,
+        data: { label },
+        position: positions.get(node.id) ?? { x: 0, y: 0 },
+        title: node.name,
+        style: {
+          background: getNodeColor(node.type),
+          color: '#fff',
+          padding: d > 0 ? 9 : 6,
+          borderRadius: 10,
+          fontSize,
+          fontWeight: 600,
+          border: d >= maxDegree * 0.6 ? '2px solid rgba(255,255,255,0.85)' : '1px solid rgba(255,255,255,0.25)',
+          boxShadow: '0 2px 6px -1px rgba(0,0,0,0.18)',
+          minWidth,
+          maxWidth: 220,
+          opacity: d === 0 ? 0.45 : 1,
+          textAlign: 'center' as const,
+        },
+      };
+    });
+
+    const flowEdges = keptEdges.map((edge) => {
+      const confidence = parseFloat(edge.confidence ?? '0.5');
+      return {
+        id: edge.id,
+        source: edge.sourceId,
+        target: edge.targetId,
+        // Edge labels on a dense graph are noise. Show the relationship type
+        // only once the view is sparse enough to read it.
+        label: keptEdges.length <= 40 ? edge.type : undefined,
+        type: 'smoothstep',
+        style: {
+          stroke: '#cbd5e1',
+          strokeWidth: 1 + confidence,
+          opacity: 0.55 + confidence * 0.35,
+        },
+        labelStyle: { fill: '#94a3b8', fontWeight: 500, fontSize: 10 },
+        labelBgStyle: { fill: '#ffffff', fillOpacity: 0.85 },
+      };
+    });
+
+    return { flowNodes, flowEdges, totalEdges: rawEdges.length, isolatedCount };
+  }, [nodesData, edgesData, minConfidence, showIsolated]);
 
   return (
     <div className="space-y-6 animate-fadeIn">
@@ -215,9 +265,25 @@ export default function Explorer() {
               </div>
 
               <div className="text-sm text-gray-500 ml-auto">
-                <span className="font-semibold text-gray-700">{flowNodes.length}</span> nodes ·{' '}
+                <span className="font-semibold text-gray-700">{flowNodes.length}</span> connected ·{' '}
                 <span className="font-semibold text-gray-700">{flowEdges.length}</span>
                 {totalEdges > flowEdges.length ? ` of ${totalEdges}` : ''} edges
+              </div>
+              <div className="text-sm">
+                <label
+                  className="flex items-center space-x-2 cursor-pointer select-none text-gray-500 hover:text-gray-700"
+                  title="Nodes with no relationship at the current confidence threshold"
+                >
+                  <input
+                    type="checkbox"
+                    checked={showIsolated}
+                    onChange={(e) => setShowIsolated(e.target.checked)}
+                    className="rounded border-gray-300"
+                  />
+                  <span>
+                    Show {isolatedCount} unconnected
+                  </span>
+                </label>
               </div>
             </div>
           </div>

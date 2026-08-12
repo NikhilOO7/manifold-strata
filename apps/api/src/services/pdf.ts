@@ -1,4 +1,11 @@
 import { PDFParse } from 'pdf-parse';
+import {
+  readBodyWithLimit,
+  maxPdfBytes,
+  HttpTooLargeError,
+  TIMEOUTS,
+} from './http';
+import { politeFetch } from './polite-fetch';
 
 export interface PDFContent {
   text: string;
@@ -45,17 +52,24 @@ function cleanExtractedText(text: string): string {
 
 export async function fetchAndExtractPDF(url: string, retries: number = 3): Promise<PDFContent> {
   let lastError: Error | null = null;
+  const sizeCap = maxPdfBytes();
 
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       console.log(`Fetching PDF (attempt ${attempt}/${retries}): ${url}`);
-      
-      const response = await fetch(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (compatible; KnowledgeGraphBot/1.0)',
-          'Accept': 'application/pdf',
+
+      // Same throttle as the metadata call — the PDF host is usually the same
+      // origin, and a burst of downloads earns the same 429.
+      const response = await politeFetch(
+        url,
+        {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (compatible; KnowledgeGraphBot/1.0)',
+            Accept: 'application/pdf',
+          },
         },
-      });
+        { timeoutMs: TIMEOUTS.pdf, label: 'PDF download', attempts: 2 }
+      );
 
       if (!response.ok) {
         throw new Error(`Failed to fetch PDF: ${response.status} ${response.statusText}`);
@@ -66,8 +80,9 @@ export async function fetchAndExtractPDF(url: string, retries: number = 3): Prom
         console.warn(`Unexpected content type: ${contentType}`);
       }
 
-      const arrayBuffer = await response.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
+      // Streamed with a hard ceiling: `arrayBuffer()` would allocate whatever the
+      // remote sends, so one oversized or hostile URL could OOM the whole API.
+      const buffer = await readBodyWithLimit(response, sizeCap, 'PDF download');
 
       if (buffer.length < 1000) {
         throw new Error('PDF file too small, likely an error page');
@@ -78,12 +93,19 @@ export async function fetchAndExtractPDF(url: string, retries: number = 3): Prom
       return await extractTextFromPDF(buffer);
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
+
+      // An oversized document is a deterministic property of the URL. Retrying
+      // just re-downloads the same bytes and burns the worker slot again.
+      if (error instanceof HttpTooLargeError) {
+        throw error;
+      }
+
       console.error(`Attempt ${attempt} failed:`, lastError.message);
 
       if (attempt < retries) {
         const delay = Math.pow(2, attempt) * 1000;
         console.log(`Retrying in ${delay / 1000} seconds...`);
-        await new Promise(resolve => setTimeout(resolve, delay));
+        await new Promise((resolve) => setTimeout(resolve, delay));
       }
     }
   }

@@ -1,4 +1,4 @@
-import { generateStructuredCompletion } from '../services/ollama';
+import { generateStructuredCompletion } from '../services/llm';
 import { createExtractionSystemPrompt, createExtractionUserPrompt } from './prompts/extraction';
 import { getDomain, type DomainConfig } from '../domains';
 
@@ -31,32 +31,33 @@ export interface ExtractorOutput {
   relationships: Relationship[];
 }
 
+/**
+ * Extract entity mentions and candidate relationships from one chunk.
+ *
+ * Throws on model failure rather than returning `{entities: [], relationships: []}`.
+ * An empty result and a failed call are different facts about the corpus: the
+ * first says "this chunk asserts nothing", the second says "we do not know what
+ * this chunk asserts". Collapsing them let a total LLM outage produce a paper
+ * marked fully processed with an empty graph. The processor decides the policy.
+ */
 export async function extractEntitiesAndRelationships(
   input: ExtractorInput
 ): Promise<ExtractorOutput> {
-  try {
-    const domain = input.domain ?? getDomain();
-    const systemPrompt = createExtractionSystemPrompt(domain);
-    const userPrompt = createExtractionUserPrompt(input.text, input.section, domain.name);
+  const domain = input.domain ?? getDomain();
+  const systemPrompt = createExtractionSystemPrompt(domain);
+  const userPrompt = createExtractionUserPrompt(input.text, input.section, domain.name);
 
-    const result = await generateStructuredCompletion<ExtractorOutput>(
-      systemPrompt,
-      userPrompt,
-      null,
-      0.3,
-      2,
-      'extractor'
-    );
+  const result = await generateStructuredCompletion<ExtractorOutput>(
+    systemPrompt,
+    userPrompt,
+    null,
+    0.3,
+    2,
+    'extractor'
+  );
 
-    return {
-      entities: result.entities || [],
-      relationships: result.relationships || [],
-    };
-  } catch (error) {
-    console.error('Error in extractor agent:', error);
-    return {
-      entities: [],
-      relationships: [],
-    };
-  }
+  return {
+    entities: Array.isArray(result?.entities) ? result.entities : [],
+    relationships: Array.isArray(result?.relationships) ? result.relationships : [],
+  };
 }

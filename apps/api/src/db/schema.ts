@@ -1,5 +1,6 @@
-import { pgTable, uuid, text, timestamp, boolean, integer, decimal, jsonb, date, pgEnum, primaryKey, index } from 'drizzle-orm/pg-core';
-import { relations } from 'drizzle-orm';
+import { pgTable, uuid, text, timestamp, boolean, integer, decimal, jsonb, date, pgEnum, primaryKey, index, vector } from 'drizzle-orm/pg-core';
+import { relations, sql } from 'drizzle-orm';
+import { VECTOR_DIMENSIONS } from '../services/embedding-space';
 
 // Node and edge `type` columns are intentionally free-form `text` (not pgEnum):
 // the extractor can discover new entity/relationship types and they are stored
@@ -39,6 +40,17 @@ export const papers = pgTable('papers', {
   venue: text('venue'),
   domain: text('domain'),
   rawText: text('raw_text'),
+  /** Which connector produced this document ('arxiv', 'openapi', …). */
+  connector: text('connector'),
+  /**
+   * Pre-extracted units from a structured connector.
+   *
+   * Persisted rather than passed in memory so that reprocessing a structured
+   * document behaves exactly like reprocessing a text one — the pipeline reads
+   * its input from the row either way, and neither path needs the original
+   * source to still be reachable.
+   */
+  structuredUnits: jsonb('structured_units'),
   processed: boolean('processed').default(false).notNull(),
   processingStatus: processingStatusEnum('processing_status').default('pending').notNull(),
   processingProgress: integer('processing_progress').default(0),
@@ -125,18 +137,105 @@ export const sources = pgTable('sources', {
 // status survives server restarts and is queryable across processes. The
 // in-process worker (apps/api/src/queue) claims and runs these.
 export const jobs = pgTable('jobs', {
-  id: text('id').primaryKey(),                     // "job-{timestamp}-{random}"
+  id: text('id').primaryKey(),                     // "job-{timestamp}-{counter}-{random}"
   type: text('type').notNull(),                    // 'ingest' | 'process'
   status: jobStatusEnum('status').default('queued').notNull(),
   paperId: uuid('paper_id').references(() => papers.id, { onDelete: 'set null' }),
   progress: text('progress'),                      // human-readable status message
   error: text('error'),
   metadata: jsonb('metadata'),                     // flexible payload (arxivId, autoProcess, ...)
+  // Which API instance owns this job. The worker is in-process, so a queued job
+  // only exists in the memory of the instance that accepted it — no other
+  // instance can ever run it. Recording the owner is what lets startup recovery
+  // fail *its own* interrupted jobs without destroying another instance's live
+  // work (which a global sweep did).
+  owner: text('owner'),
+  // Lease renewed while the job runs. If an instance dies for good, its lease
+  // lapses and any instance may then recover the job.
+  leaseExpiresAt: timestamp('lease_expires_at'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 }, (table) => ({
   statusIdx: index('jobs_status_idx').on(table.status),
   paperIdIdx: index('jobs_paper_id_idx').on(table.paperId),
+  ownerIdx: index('jobs_owner_idx').on(table.owner),
+}));
+
+// --- Identity, authorization, audit ----------------------------------------
+//
+// Domain isolation was, until now, a *data* boundary only: the query layer
+// scoped every read, and tests proved it, but nothing bound a caller to a
+// domain. One shared `API_KEY` opened every domain and read routes needed no key
+// at all. These tables make the boundary an *authorization* boundary — a
+// credential grants access to named domains and nothing else.
+
+export const tenants = pgTable('tenants', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  name: text('name').notNull(),
+  slug: text('slug').notNull().unique(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+}, (table) => ({
+  slugIdx: index('tenants_slug_idx').on(table.slug),
+}));
+
+/**
+ * A credential holder — a person or an agent.
+ *
+ * The secret is never stored. A key is issued as `mk_<prefix>_<secret>`: the
+ * prefix is an indexed lookup handle so verification is a single row fetch
+ * rather than a scan-and-compare over every principal, and only the hash of the
+ * secret is persisted. A database dump therefore does not yield working keys.
+ */
+export const principals = pgTable('principals', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  tenantId: uuid('tenant_id').notNull().references(() => tenants.id, { onDelete: 'cascade' }),
+  name: text('name').notNull(),
+  /** 'user' | 'agent' — recorded for audit reading, not for permission logic. */
+  kind: text('kind').notNull().default('agent'),
+  /** Public lookup handle, safe to log. */
+  keyPrefix: text('key_prefix').notNull().unique(),
+  /** SHA-256 of the secret half. */
+  keyHash: text('key_hash').notNull(),
+  /** Capability scopes: 'read' | 'write' | 'admin'. */
+  scopes: jsonb('scopes').notNull(),
+  /**
+   * Domains this principal may touch. An empty array grants nothing; the
+   * wildcard is deliberately explicit (`['*']`) so that a missing or malformed
+   * grant list denies rather than opens everything.
+   */
+  domains: jsonb('domains').notNull(),
+  expiresAt: timestamp('expires_at'),
+  revokedAt: timestamp('revoked_at'),
+  lastUsedAt: timestamp('last_used_at'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+}, (table) => ({
+  prefixIdx: index('principals_key_prefix_idx').on(table.keyPrefix),
+  tenantIdx: index('principals_tenant_idx').on(table.tenantId),
+}));
+
+/**
+ * What every credential did.
+ *
+ * Written for both allowed and denied attempts — a denial is the more
+ * interesting record, and an audit trail that only contains successes cannot
+ * answer the question anyone actually asks after an incident.
+ */
+export const auditLog = pgTable('audit_log', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  principalId: uuid('principal_id').references(() => principals.id, { onDelete: 'set null' }),
+  tenantId: uuid('tenant_id').references(() => tenants.id, { onDelete: 'set null' }),
+  /** Human-readable principal label, retained even if the principal is deleted. */
+  actor: text('actor'),
+  action: text('action').notNull(),          // 'field.query', 'graph.nodes', ...
+  domain: text('domain'),
+  outcome: text('outcome').notNull(),        // 'allowed' | 'denied' | 'error'
+  detail: jsonb('detail'),                   // query text, evidence count, reason
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+}, (table) => ({
+  principalIdx: index('audit_log_principal_idx').on(table.principalId),
+  createdAtIdx: index('audit_log_created_at_idx').on(table.createdAt),
+  actionIdx: index('audit_log_action_idx').on(table.action),
+  outcomeIdx: index('audit_log_outcome_idx').on(table.outcome),
 }));
 
 // --- Manifold: geometric knowledge field ---------------------------------
@@ -148,12 +247,21 @@ export const jobs = pgTable('jobs', {
 export const nodeVectors = pgTable('node_vectors', {
   id: uuid('id').defaultRandom().primaryKey(),
   nodeId: uuid('node_id').notNull().unique().references(() => nodes.id, { onDelete: 'cascade' }),
-  embedding: jsonb('embedding').notNull(),       // number[]
+  // pgvector column: nearest-neighbour search happens in Postgres against an HNSW
+  // index. Reading vectors into JS to score them cost O(corpus) bytes per query —
+  // roughly 300 MB at ten thousand entities — which is what made retrieval
+  // unusable past demo scale.
+  embeddingVec: vector('embedding_vec', { dimensions: VECTOR_DIMENSIONS }),
   hyperbolic: jsonb('hyperbolic'),               // number[] | null (Poincaré ball coords)
   model: text('model'),
+  /** `provider:model:dimensions` — makes a mixed-space corpus detectable. */
+  space: text('space'),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 }, (table) => ({
   nodeIdIdx: index('node_vectors_node_id_idx').on(table.nodeId),
+  // Cosine distance, matching the similarity used throughout the field layer.
+  embeddingHnsw: index('node_vectors_embedding_hnsw')
+    .using('hnsw', table.embeddingVec.op('vector_cosine_ops')),
 }));
 
 // Atomic factual propositions (sentence-split relationship evidence) with their
@@ -163,14 +271,26 @@ export const propositions = pgTable('propositions', {
   id: uuid('id').defaultRandom().primaryKey(),
   paperId: uuid('paper_id').references(() => papers.id, { onDelete: 'cascade' }),
   text: text('text').notNull(),
-  embedding: jsonb('embedding'),                 // number[] | null
+  embeddingVec: vector('embedding_vec', { dimensions: VECTOR_DIMENSIONS }),
   nodeIds: jsonb('node_ids'),                    // string[] (uuids this proposition mentions)
   section: text('section'),
   domain: text('domain'),
+  space: text('space'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 }, (table) => ({
   paperIdIdx: index('propositions_paper_id_idx').on(table.paperId),
   domainIdx: index('propositions_domain_idx').on(table.domain),
+  embeddingHnsw: index('propositions_embedding_hnsw')
+    .using('hnsw', table.embeddingVec.op('vector_cosine_ops')),
+  // Lexical ranking is part of the retrieval hot path (rank fusion), not just a
+  // benchmark baseline. Without this expression index every query recomputes
+  // to_tsvector over every proposition in the corpus.
+  textSearchGin: index('propositions_text_search_gin')
+    .using('gin', sql`to_tsvector('english', ${table.text})`),
+  // Evidence gathering asks "which propositions mention any of these node ids".
+  // Without a GIN index that predicate is a sequential scan over every
+  // proposition in the corpus, decoding each JSONB array.
+  nodeIdsGin: index('propositions_node_ids_gin').using('gin', table.nodeIds),
 }));
 
 // Cached GraphRAG-style community summaries: one LLM summary per cluster,

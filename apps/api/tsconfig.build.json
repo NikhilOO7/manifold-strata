@@ -1,0 +1,9 @@
+{
+  // Production build: same settings, minus the tests.
+  //
+  // `pnpm build` runs plain `tsc` with an outDir, so without this the test files
+  // under src/__tests__ were compiled into dist/ and shipped alongside the
+  // server — including the Postgres-backed suite that deletes rows.
+  "extends": "./tsconfig.json",
+  "exclude": ["node_modules", "dist", "src/__tests__"]
+}

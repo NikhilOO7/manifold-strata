@@ -27,24 +27,51 @@ export interface ExistingNode {
   normalizedName: string | null;
 }
 
-type EntityType = 'method' | 'concept' | 'dataset' | 'metric' | 'paper';
+/**
+ * Entity types are open — any non-empty string a domain or connector uses.
+ *
+ * This used to collapse anything outside a hardcoded list of five to `concept`,
+ * which silently contradicted the system's own claim that types are free-form.
+ * The cost only became visible with a structured source: importing an API
+ * surface produced `api`, `endpoint`, `capability`, `schema` and `auth` entities
+ * and stored all of them as `concept`, discarding a taxonomy the source had
+ * stated exactly and that nothing downstream could recover.
+ */
+type EntityType = string;
 
 // Cosine threshold for treating a mention as an existing node. Same-type matches
 // use a slightly lower bar than cross-type (which we disallow except paper).
 const SIM_THRESHOLD = 0.82;
 
+/**
+ * Canonical form of a type. Only `paper_reference` is folded (into `paper`),
+ * because the extractor emits both names for the same thing; every other type
+ * is preserved as written.
+ */
 function normalizeType(t: string): EntityType {
-  if (t === 'paper_reference' || t === 'paper') return 'paper';
-  if (t === 'method' || t === 'concept' || t === 'dataset' || t === 'metric') return t;
-  return 'concept';
+  const canonical = (t || '').trim().toLowerCase();
+  if (canonical === 'paper_reference' || canonical === 'paper') return 'paper';
+  return canonical || 'concept';
 }
 
 function norm(s: string): string {
   return s.toLowerCase().trim();
 }
 
+/**
+ * Map a predicate to an edge type.
+ *
+ * A predicate that is already an identifier — `exposes`, `belongs_to`,
+ * `evaluates_on` — is used verbatim. Structured connectors and domain ontologies
+ * state their relationship types precisely, and running them through the
+ * natural-language keyword mapping below turned every one of them into `uses`.
+ * Only prose predicates, which is what a language model produces, get mapped.
+ */
 function toEdgeType(predicate: string): string {
-  const p = (predicate || '').toLowerCase();
+  const raw = (predicate || '').trim();
+  if (/^[a-z][a-z0-9_]*$/.test(raw)) return raw;
+
+  const p = raw.toLowerCase();
   if (p.includes('extend')) return 'extends';
   if (p.includes('improv') || p.includes('outperform') || p.includes('better than')) return 'improves';
   if (p.includes('introduc') || p.includes('propos') || p.includes('present')) return 'introduces';

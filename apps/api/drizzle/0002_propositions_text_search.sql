@@ -1,0 +1,1 @@
+CREATE INDEX "propositions_text_search_gin" ON "propositions" USING gin (to_tsvector('english', "text"));

@@ -4,6 +4,12 @@
     "module": "ESNext",
     "lib": ["ES2022"],
     "moduleResolution": "bundler",
+    // Explicit rather than relying on TypeScript's implicit "include every
+    // @types package it can find" behaviour. That default is sensitive to how
+    // the package manager laid out node_modules, which is why editors reported
+    // `process`, `console`, `NodeJS` and `node:*` imports as unresolved while
+    // the CLI build passed — the two were resolving different type roots.
+    "types": ["node"],
     "esModuleInterop": true,
     "skipLibCheck": true,
     "strict": true,
@@ -13,11 +19,9 @@
     "resolveJsonModule": true,
     "allowSyntheticDefaultImports": true,
     "outDir": "./dist",
-    "rootDir": "./src",
-    "baseUrl": "./src",
-    "paths": {
-      "@/*": ["./*"]
-    }
+    "rootDir": "./src"
+    // No baseUrl/paths: the `@/*` alias was declared but never imported
+    // anywhere, and `baseUrl` is deprecated in TypeScript 6+.
   },
   "include": ["src/**/*"],
   "exclude": ["node_modules", "dist"]

@@ -9,9 +9,9 @@
 
 import { db } from '../db';
 import { nodes, edges, communities, propositions } from '../db/schema';
-import { getDomain } from '../domains';
+import { resolveDomain } from '../domains';
 import { domainWhere } from '../domains/filter';
-import { generateCompletion } from '../services/ollama';
+import { generateCompletion } from '../services/llm';
 import { embedOne } from '../services/embeddings';
 
 /** Label propagation over the undirected graph. Returns nodeId -> communityLabel. */
@@ -33,8 +33,15 @@ function labelPropagation(
 
   for (let iter = 0; iter < iterations; iter++) {
     let changed = false;
-    // Shuffle for asynchronous updates.
-    const order = [...nodeIds].sort(() => Math.random() - 0.5);
+    // Shuffle for asynchronous updates. Fisher–Yates rather than
+    // `.sort(() => Math.random() - 0.5)`: an inconsistent comparator is not a
+    // uniform shuffle (and is implementation-defined), which biased which labels
+    // won and made communities depend on the engine's sort internals.
+    const order = [...nodeIds];
+    for (let i = order.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [order[i], order[j]] = [order[j], order[i]];
+    }
     for (const id of order) {
       const nbrs = neighbors.get(id)!;
       if (nbrs.length === 0) continue;
@@ -67,7 +74,7 @@ export interface BuildCommunitiesResult {
 }
 
 export async function buildCommunities(domainId?: string, minSize = 3): Promise<BuildCommunitiesResult> {
-  const domain = getDomain(domainId).id;
+  const domain = resolveDomain(domainId).id;
   const allNodes = await db.select().from(nodes).where(domainWhere(nodes.domain, domain));
   const nameById = new Map(allNodes.map((n) => [n.id, n.name]));
   const edgeRows = await db
@@ -115,10 +122,14 @@ export async function buildCommunities(domainId?: string, minSize = 3): Promise<
         'focusing on the shared theme and key relationships.';
       const user = `Entities: ${memberNames.join(', ')}\n\nEvidence:\n${sampleProps.join('\n')}`;
       const completion = await generateCompletion(system, user, 0.3, 'community-summary');
-      if (completion.text.trim()) summary = completion.text.trim();
-      summarized++;
+      // Only counts as summarized when an actual summary came back — an empty
+      // completion still leaves the mechanical member-list fallback in place.
+      if (completion.text.trim()) {
+        summary = completion.text.trim();
+        summarized++;
+      }
     } catch (e) {
-      console.warn('Community summary failed, using fallback:', e);
+      console.warn('Community summary failed, using member-list fallback:', e);
     }
 
     let embedding: number[] | null = null;

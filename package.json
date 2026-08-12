@@ -6,10 +6,19 @@
   "scripts": {
     "dev": "pnpm --parallel --filter api --filter web dev",
     "build": "pnpm --filter api build && pnpm --filter web build",
+    "typecheck": "pnpm --filter api typecheck && pnpm --filter web typecheck",
+    "test": "pnpm --filter api test",
+    "test:db": "pnpm --filter api test:db",
     "db:push": "pnpm --filter api db:push",
     "db:studio": "pnpm --filter api db:studio"
   },
-  "keywords": ["knowledge-graph", "hyperbolic-embeddings", "hipporag", "retrieval", "ai-agents"],
+  "keywords": [
+    "knowledge-graph",
+    "hyperbolic-embeddings",
+    "hipporag",
+    "retrieval",
+    "ai-agents"
+  ],
   "author": "",
   "license": "MIT",
   "engines": {

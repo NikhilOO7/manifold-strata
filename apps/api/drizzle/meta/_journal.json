@@ -1,0 +1,41 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1786490929720,
+      "tag": "0000_add_pgvector_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1786493061678,
+      "tag": "0001_drop_jsonb_embeddings",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1786495122120,
+      "tag": "0002_propositions_text_search",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1786496234789,
+      "tag": "0003_identity_and_audit",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1786497299478,
+      "tag": "0004_connector_documents",
+      "breakpoints": true
+    }
+  ]
+}
