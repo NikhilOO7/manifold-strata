@@ -55,7 +55,8 @@ apps/api/src/
                     communities, retrieve  ← the geometric layer
   services/      llm (Ollama|OpenAI), embeddings, http (timeouts), pdf, metrics
   pipeline/      processor.ts — field/legacy orchestration, the write path
-  queue/         in-process bounded worker + durable `jobs` table
+  jobs/          job handlers (arXiv ingest, paper processing) + registry
+  queue/         durable claimable queue (SKIP LOCKED) with fetch/process lanes
   middleware/    auth, rate-limit
   connectors/    source adapters (contract + registry); structured ones emit a
                  graph directly and cost zero LLM calls
@@ -100,11 +101,19 @@ packages/shared/ shared types
 8. **Processing is idempotent.** Re-running a paper clears its prior contribution
    first (`clearPaperContributions`) — nodes are shared and survive, edges another
    paper also asserts survive.
-9. **A job belongs to the instance that accepted it.** `createJob` stamps
-   `owner = INSTANCE_ID` and a lease the worker renews. Startup recovery may fail
-   only its own jobs and lease-expired ones. Never widen that to "all non-terminal
-   jobs" — a second process (test run, second instance, `tsx watch` reload) then
-   kills live work on another instance.
+9. **The jobs table IS the queue.** Work is enqueued by inserting a row
+   (`status='queued'`, no owner) and executed by claiming it —
+   `claimNextJob`'s `FOR UPDATE SKIP LOCKED` update, nothing else. Never hold
+   queued work in process memory; that shape loses the backlog on every restart,
+   which is fatal for batches that run for hours. Claiming sets owner/lease and
+   increments `attempts`; startup recovery RE-QUEUES interrupted work (own jobs
+   and expired leases) until `MAX_JOB_ATTEMPTS`, then fails it honestly. It must
+   still never touch another instance's live-leased job — that regression
+   shipped once. Handlers signal unretriable failures with `PermanentJobError`;
+   everything else is presumed transient. The process-lane handler always clears
+   the paper's prior contribution first, so retries cannot duplicate edges
+   (proven by a kill-9/restart run). Batch progress is always computed from
+   member jobs, never from counters.
 10. **An outage is decided once.** `LLMUnavailableError` for
     `LLM_UNAVAILABLE_ABORT_AFTER` consecutive chunks abandons the paper. Content
     failures (unparseable JSON) stay per-chunk.
@@ -130,9 +139,10 @@ packages/shared/ shared types
 
 ## Known gaps (honest state — next on the queue)
 
-- Single-instance worker. Ownership + leases stop cross-instance destruction, but a
-  *queued* job still lives only in its owner's memory, so it is lost if that process
-  dies before starting it. True horizontal scale needs BullMQ + Redis.
+- The queue is now durable and multi-instance (Postgres SKIP LOCKED claims), so
+  queued work survives restarts and any instance can drain any lane. BullMQ/Redis
+  remains the escape hatch only if volume ever outgrows Postgres — the claim
+  contract is local to `queue/index.ts`.
 - Rate limiting is per-instance and in-memory; N instances allow N× the limit.
 - Authorization is enforced in the application layer only. Postgres row-level
   security beneath it would make a forgotten filter harmless rather than merely
@@ -142,9 +152,10 @@ packages/shared/ shared types
 - Retrieval is on pgvector + HNSW and measures 153 ms p50 at 100k entities, but the
   1M-entity target is unproven and latency still grows with corpus size through
   cache pressure. Next levers: `halfvec`, lower `hnsw.ef_search`, fewer dimensions.
-- Entity resolution still compares in JS against at most
-  `RESOLUTION_CANDIDATE_LIMIT` (2000) recent in-domain nodes and logs when it hits
-  the cap. It should move to the same ANN index retrieval now uses.
+- Resolution now reads the index (invariant 24), so *which* candidates it sees is
+  settled. What is unproven is the threshold: 0.82 cosine and the same-type rule
+  were chosen by inspection, not by a harness like the one governing retrieval.
+  A false merge is harder to notice than a false split — measure this next.
 - Hyperbolic/community layers are batch, not incrementally maintained.
 - No cross-domain bridges: the same concept studied in two fields is two nodes.
 
@@ -174,6 +185,26 @@ packages/shared/ shared types
     it means re-ingesting), economise on verbalization (synthesis over retrieved
     evidence is easy). Roles route via `MODEL_<ROLE>`; the table is printed at
     startup and served from `/health`.
+24. **Entity resolution reads the index, never a window.** Candidates come from
+    `knowledge-field/resolve-candidates.ts`: one batched equality probe on
+    `nodes_normalized_name_idx` and one batched k-NN lateral over
+    `node_vectors_embedding_hnsw`, both scoped to the domain. Never reintroduce a
+    "most recent N nodes" preload — that shape made identity depend on creation
+    order, so past N nodes a domain forked entities it already contained and only
+    logged about it. Filtered ANN asks for `hnsw.iterative_scan` so a domain that
+    is a small slice of the corpus still gets K eligible neighbours instead of
+    silently fewer. Mentions that are new to the graph are also compared against
+    *each other* before minting identities — one chunk naming a thing twice is
+    the same defect on the other side of the batch boundary. And never use
+    `ilike` where `eq` is meant: on 100k nodes it was a Seq Scan discarding every
+    row (cost 3039) against an index scan at cost 12.
+25. **A signal is a shutdown, not a crash.** SIGTERM/SIGINT close the HTTP
+    server, stop claiming, drain in-flight work for `SHUTDOWN_GRACE_MS`, then
+    close the pool. Shutdown must NOT release still-running claims — the job is
+    still executing here, so another instance would run the same extraction
+    concurrently. Leave it leased; expiry is the safe handover, and it is
+    bounded.
+
 23. **Retrieval tuning is decided by the harness, not by argument.** Run
     `pnpm --filter api eval` before and after any change to PPR, MMR, fusion
     weights, seed count, or hop limits. Two tuning decisions have already been

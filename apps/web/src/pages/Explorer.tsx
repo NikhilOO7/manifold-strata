@@ -1,57 +1,78 @@
 import { useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import ReactFlow, { Background, Controls, MiniMap } from 'reactflow';
+import ReactFlow, { Background, Controls, MarkerType } from 'reactflow';
 import 'reactflow/dist/style.css';
+import type { Node as GraphNode } from 'shared';
 import { api } from '../lib/api';
-import { computeForceLayout } from '../lib/layout';
+import { computeEgoLayout } from '../lib/layout';
+
+/**
+ * The Explorer is a navigation surface, not a map.
+ *
+ * Two rounds of tuning the force-directed overview proved the idea itself was
+ * wrong: 60+ boxes in one simulation is unreadable no matter how it is styled,
+ * because a global layout answers a question nobody is asking. The question
+ * people actually ask of a knowledge graph is local — "what relates to THIS,
+ * and how?" — so the page is built around that:
+ *
+ *   pick an entity (search, or the most-connected list)
+ *     → see only its neighbourhood, radially: outgoing right, incoming left,
+ *       grouped by relationship type, every label readable
+ *     → click any neighbour to make it the new centre; breadcrumbs remember
+ *       the path
+ *
+ * Every screen shows five to thirty nodes. The hairball is gone because it was
+ * never information.
+ */
+
+interface Crumb {
+  id: string;
+  name: string;
+}
 
 export default function Explorer() {
-  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [centerId, setCenterId] = useState<string | null>(null);
+  const [trail, setTrail] = useState<Crumb[]>([]);
   const [searchTerm, setSearchTerm] = useState('');
-  const [nodeTypeFilter, setNodeTypeFilter] = useState<string>('');
-  const [minConfidence, setMinConfidence] = useState(0);
-  const [nodeLimit, setNodeLimit] = useState(100);
-  // Isolated nodes are hidden by default: in a relationship explorer a node with
-  // no edges is occupied space, not information.
-  const [showIsolated, setShowIsolated] = useState(false);
   const [domainFilter, setDomainFilter] = useState('');
+  const [depth, setDepth] = useState<1 | 2>(1);
 
   const { data: domainsData } = useQuery({
     queryKey: ['domains'],
     queryFn: () => api.domains.list(),
   });
 
-  const { data: nodesData, isLoading } = useQuery({
-    queryKey: ['nodes', nodeTypeFilter, searchTerm, nodeLimit, domainFilter],
-    queryFn: () =>
-      api.graph.nodes({
-        type: nodeTypeFilter || undefined,
-        search: searchTerm || undefined,
-        limit: nodeLimit,
-        domain: domainFilter || undefined,
-      }),
+  // One modest fetch powers the "most connected" entry points; this is a list,
+  // not a rendered graph, so its size costs nothing visually.
+  const { data: nodesData } = useQuery({
+    queryKey: ['explorer-nodes', domainFilter],
+    queryFn: () => api.graph.nodes({ limit: 500, domain: domainFilter || undefined }),
   });
-
   const { data: edgesData } = useQuery({
-    queryKey: ['edges', domainFilter],
+    queryKey: ['explorer-edges', domainFilter],
     queryFn: () => api.graph.edges({ limit: 500, domain: domainFilter || undefined }),
   });
 
-  // Node types present in the graph — drives the filter dropdown dynamically so
-  // newly discovered types show up without code changes (scoped to the domain).
-  const { data: typesData } = useQuery({
-    queryKey: ['graph-types', domainFilter],
-    queryFn: () => api.graph.types(domainFilter || undefined),
+  const { data: searchData, isFetching: searching } = useQuery({
+    queryKey: ['explorer-search', searchTerm, domainFilter],
+    queryFn: () =>
+      api.graph.nodes({ search: searchTerm, limit: 20, domain: domainFilter || undefined }),
+    enabled: searchTerm.trim().length > 1,
   });
 
-  const { data: selectedNodeData } = useQuery({
-    queryKey: ['node', selectedNodeId],
-    queryFn: () => api.graph.node(selectedNodeId!),
-    enabled: !!selectedNodeId,
+  const { data: ego, isLoading: egoLoading } = useQuery({
+    queryKey: ['ego', centerId, depth],
+    queryFn: () => api.graph.subgraph(centerId!, depth),
+    enabled: !!centerId,
   });
 
-  // Stable colors for known types; any newly discovered type gets a deterministic
-  // color from the palette (hashed by name) so it's consistent across renders.
+  // Rich context for the centre: description, corpus mentions, typed neighbours.
+  const { data: centerDetail } = useQuery({
+    queryKey: ['node-detail', centerId],
+    queryFn: () => api.graph.node(centerId!),
+    enabled: !!centerId,
+  });
+
   const getNodeColor = (type: string): string => {
     const known: Record<string, string> = {
       paper: '#3b82f6',
@@ -67,350 +88,394 @@ export default function Explorer() {
     return palette[h % palette.length];
   };
 
-  // Build flow nodes/edges: filter edges by confidence and to the currently
-  // loaded node set, then run a force-directed layout so related nodes cluster.
-  const { flowNodes, flowEdges, totalEdges, isolatedCount } = useMemo(() => {
-    const rawNodes = nodesData?.nodes ?? [];
-    const rawEdges = edgesData?.edges ?? [];
-    const visibleIds = new Set(rawNodes.map((n) => n.id));
-
-    const keptEdges = rawEdges.filter(
-      (e) =>
-        visibleIds.has(e.sourceId) &&
-        visibleIds.has(e.targetId) &&
-        parseFloat(e.confidence ?? '0') >= minConfidence
-    );
-
-    // Degree drives both what is shown and how it is drawn. A graph explorer is
-    // about relationships, so a node with no surviving edge contributes nothing
-    // but occupied space — and at the default settings those were the majority
-    // of what was on screen (100 nodes carrying 45 edges).
+  /** Ranked entry points: the entities with the most relationships. */
+  const hubs = useMemo(() => {
+    const nodes = nodesData?.nodes ?? [];
+    const edges = edgesData?.edges ?? [];
     const degree = new Map<string, number>();
-    for (const id of visibleIds) degree.set(id, 0);
-    for (const e of keptEdges) {
+    for (const e of edges) {
       degree.set(e.sourceId, (degree.get(e.sourceId) ?? 0) + 1);
       degree.set(e.targetId, (degree.get(e.targetId) ?? 0) + 1);
     }
+    return nodes
+      .map((n) => ({ node: n, degree: degree.get(n.id) ?? 0 }))
+      .filter((h) => h.degree > 0)
+      .sort((a, b) => b.degree - a.degree)
+      .slice(0, 14);
+  }, [nodesData, edgesData]);
 
-    const connected = rawNodes.filter((n) => (degree.get(n.id) ?? 0) > 0);
-    const isolatedCount = rawNodes.length - connected.length;
-    const shown = showIsolated ? rawNodes : connected;
+  const navigateTo = (node: Pick<GraphNode, 'id' | 'name'>) => {
+    setCenterId(node.id);
+    setTrail((prev) => {
+      const existing = prev.findIndex((c) => c.id === node.id);
+      // Revisiting a crumb truncates the path back to it, like a file browser.
+      if (existing !== -1) return prev.slice(0, existing + 1);
+      return [...prev, { id: node.id, name: node.name }];
+    });
+    setSearchTerm('');
+  };
 
-    // Give the simulation room proportional to what it has to place; a fixed
-    // canvas is what forced everything into an overlapping ball.
-    const span = Math.max(1200, Math.ceil(Math.sqrt(Math.max(shown.length, 1)) * 260));
-    const positions = computeForceLayout(
-      shown.map((n) => ({ id: n.id })),
-      keptEdges.map((e) => ({ source: e.sourceId, target: e.targetId })),
-      { width: span, height: Math.round(span * 0.7), iterations: 420 }
+  const centerNode = useMemo(
+    () => ego?.nodes.find((n) => n.id === centerId) ?? ego?.center,
+    [ego, centerId]
+  );
+
+  // Radial layout: positions from relationships, styling from ring + type.
+  const { flowNodes, flowEdges } = useMemo(() => {
+    if (!ego || !centerId) return { flowNodes: [], flowEdges: [] };
+
+    const positions = computeEgoLayout(
+      centerId,
+      ego.edges.map((e) => ({ source: e.sourceId, target: e.targetId, type: e.type }))
     );
 
-    const maxDegree = Math.max(1, ...shown.map((n) => degree.get(n.id) ?? 0));
+    const neighbourIds = new Set<string>();
+    for (const e of ego.edges) {
+      if (e.sourceId === centerId) neighbourIds.add(e.targetId);
+      if (e.targetId === centerId) neighbourIds.add(e.sourceId);
+    }
 
-    const flowNodes = shown.map((node) => {
-      const d = degree.get(node.id) ?? 0;
-      // Scale with the square root so a hub reads as a hub without a single
-      // very-high-degree node dwarfing everything else.
-      const weight = Math.sqrt(d / maxDegree);
-      const fontSize = 10 + Math.round(weight * 5);
-      const minWidth = 96 + Math.round(weight * 84);
-      // Long labels are usually extraction artefacts (sentence fragments stored
-      // as entities). Truncate for the canvas; the full text is one click away
-      // in the details panel, and native title text covers hover.
-      const label = node.name.length > 30 ? `${node.name.slice(0, 29)}…` : node.name;
+    const flowNodes = ego.nodes
+      .filter((n) => positions.has(n.id))
+      .map((node) => {
+        const isCenter = node.id === centerId;
+        const isRingOne = neighbourIds.has(node.id);
+        const label = node.name.length > 46 ? `${node.name.slice(0, 45)}…` : node.name;
+        return {
+          id: node.id,
+          data: { label },
+          position: positions.get(node.id)!,
+          style: isCenter
+            ? {
+                background: '#0f172a',
+                color: '#fff',
+                padding: 14,
+                borderRadius: 14,
+                fontSize: 15,
+                fontWeight: 700,
+                border: `3px solid ${getNodeColor(node.type)}`,
+                boxShadow: '0 8px 24px -6px rgba(15,23,42,0.45)',
+                maxWidth: 260,
+                textAlign: 'center' as const,
+              }
+            : {
+                background: getNodeColor(node.type),
+                color: '#fff',
+                padding: isRingOne ? 10 : 7,
+                borderRadius: 10,
+                fontSize: isRingOne ? 12 : 10,
+                fontWeight: 600,
+                border: '1px solid rgba(255,255,255,0.3)',
+                opacity: isRingOne ? 1 : 0.75,
+                maxWidth: isRingOne ? 210 : 170,
+                textAlign: 'center' as const,
+              },
+        };
+      });
 
-      return {
-        id: node.id,
-        data: { label },
-        position: positions.get(node.id) ?? { x: 0, y: 0 },
-        title: node.name,
-        style: {
-          background: getNodeColor(node.type),
-          color: '#fff',
-          padding: d > 0 ? 9 : 6,
-          borderRadius: 10,
-          fontSize,
-          fontWeight: 600,
-          border: d >= maxDegree * 0.6 ? '2px solid rgba(255,255,255,0.85)' : '1px solid rgba(255,255,255,0.25)',
-          boxShadow: '0 2px 6px -1px rgba(0,0,0,0.18)',
-          minWidth,
-          maxWidth: 220,
-          opacity: d === 0 ? 0.45 : 1,
-          textAlign: 'center' as const,
-        },
-      };
-    });
-
-    const flowEdges = keptEdges.map((edge) => {
-      const confidence = parseFloat(edge.confidence ?? '0.5');
+    const flowEdges = ego.edges.map((edge) => {
+      const touchesCenter = edge.sourceId === centerId || edge.targetId === centerId;
       return {
         id: edge.id,
         source: edge.sourceId,
         target: edge.targetId,
-        // Edge labels on a dense graph are noise. Show the relationship type
-        // only once the view is sparse enough to read it.
-        label: keptEdges.length <= 40 ? edge.type : undefined,
-        type: 'smoothstep',
+        // Sparse view — the relationship type is always legible, which is the
+        // point: the edge label IS the knowledge.
+        label: edge.type.replace(/_/g, ' '),
+        type: 'straight',
+        markerEnd: { type: MarkerType.ArrowClosed, width: 16, height: 16, color: '#94a3b8' },
         style: {
-          stroke: '#cbd5e1',
-          strokeWidth: 1 + confidence,
-          opacity: 0.55 + confidence * 0.35,
+          stroke: touchesCenter ? '#64748b' : '#cbd5e1',
+          strokeWidth: touchesCenter ? 1.8 : 1,
         },
-        labelStyle: { fill: '#94a3b8', fontWeight: 500, fontSize: 10 },
-        labelBgStyle: { fill: '#ffffff', fillOpacity: 0.85 },
+        labelStyle: { fill: touchesCenter ? '#475569' : '#94a3b8', fontWeight: 600, fontSize: 11 },
+        labelBgStyle: { fill: '#ffffff', fillOpacity: 0.9 },
+        labelBgPadding: [4, 2] as [number, number],
       };
     });
 
-    return { flowNodes, flowEdges, totalEdges: rawEdges.length, isolatedCount };
-  }, [nodesData, edgesData, minConfidence, showIsolated]);
+    return { flowNodes, flowEdges };
+  }, [ego, centerId]);
+
+  const sidebarList =
+    searchTerm.trim().length > 1
+      ? (searchData?.nodes ?? []).map((n) => ({ node: n, degree: null as number | null }))
+      : hubs;
 
   return (
     <div className="space-y-6 animate-fadeIn">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-3xl font-bold bg-gradient-to-r from-gray-900 to-gray-700 bg-clip-text text-transparent">
-            Graph Explorer
-          </h1>
-          <p className="text-sm text-gray-500 mt-2 flex items-center space-x-2">
-            <svg className="w-4 h-4 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
-            </svg>
-            <span>Visualize and explore your knowledge graph relationships</span>
-          </p>
-        </div>
+      <div>
+        <h1 className="text-3xl font-bold bg-gradient-to-r from-gray-900 to-gray-700 bg-clip-text text-transparent">
+          Knowledge Explorer
+        </h1>
+        <p className="text-sm text-gray-500 mt-2">
+          Pick an entity, see everything related to it, follow the connections.
+        </p>
       </div>
 
-      {/* Main Content */}
       <div className="flex gap-6 h-[calc(100vh-12rem)]">
-        {/* Graph Canvas */}
-        <div className="flex-1 bg-white rounded-2xl border border-gray-200/60 shadow-lg overflow-hidden">
-          {/* Toolbar */}
-          <div className="p-5 border-b border-gray-200/60 bg-gradient-to-r from-white to-gray-50/50">
-            <div className="flex gap-3">
-              <div className="flex-1 relative">
-                <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                  <svg className="w-5 h-5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
-                  </svg>
-                </div>
-                <input
-                  type="text"
-                  placeholder="Search nodes..."
-                  value={searchTerm}
-                  onChange={(e) => setSearchTerm(e.target.value)}
-                  className="w-full pl-10 pr-4 py-3 border-2 border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all duration-200 text-gray-900 placeholder-gray-400"
-                />
-              </div>
-              <select
-                value={domainFilter}
-                onChange={(e) => setDomainFilter(e.target.value)}
-                className="px-4 py-3 border-2 border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all duration-200 text-gray-700 font-medium bg-white"
-              >
-                <option value="">All Domains</option>
-                {(domainsData?.domains ?? []).map((d) => (
-                  <option key={d.id} value={d.id}>
-                    {d.name}
-                  </option>
-                ))}
-              </select>
-              <select
-                value={nodeTypeFilter}
-                onChange={(e) => setNodeTypeFilter(e.target.value)}
-                className="px-4 py-3 border-2 border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all duration-200 text-gray-700 font-medium bg-white"
-              >
-                <option value="">All Types</option>
-                {(typesData?.nodeTypes ?? []).map((t) => (
-                  <option key={t} value={t}>
-                    {t.charAt(0).toUpperCase() + t.slice(1).replace(/_/g, ' ')}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            {/* Filters: confidence threshold + node limit + live counts */}
-            <div className="flex items-center gap-6 mt-3 flex-wrap">
-              <div className="flex items-center gap-3">
-                <label className="text-sm font-medium text-gray-600 whitespace-nowrap">
-                  Min confidence
-                </label>
-                <input
-                  type="range"
-                  min={0}
-                  max={1}
-                  step={0.05}
-                  value={minConfidence}
-                  onChange={(e) => setMinConfidence(parseFloat(e.target.value))}
-                  className="w-40 accent-blue-600"
-                />
-                <span className="text-sm font-mono text-gray-700 w-10">
-                  {minConfidence.toFixed(2)}
-                </span>
-              </div>
-
-              <div className="flex items-center gap-2">
-                <label className="text-sm font-medium text-gray-600 whitespace-nowrap">
-                  Max nodes
-                </label>
-                <select
-                  value={nodeLimit}
-                  onChange={(e) => setNodeLimit(parseInt(e.target.value))}
-                  className="px-3 py-2 border-2 border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 font-medium bg-white text-sm"
-                >
-                  <option value={50}>50</option>
-                  <option value={100}>100</option>
-                  <option value={200}>200</option>
-                  <option value={500}>500</option>
-                </select>
-              </div>
-
-              <div className="text-sm text-gray-500 ml-auto">
-                <span className="font-semibold text-gray-700">{flowNodes.length}</span> connected ·{' '}
-                <span className="font-semibold text-gray-700">{flowEdges.length}</span>
-                {totalEdges > flowEdges.length ? ` of ${totalEdges}` : ''} edges
-              </div>
-              <div className="text-sm">
-                <label
-                  className="flex items-center space-x-2 cursor-pointer select-none text-gray-500 hover:text-gray-700"
-                  title="Nodes with no relationship at the current confidence threshold"
-                >
-                  <input
-                    type="checkbox"
-                    checked={showIsolated}
-                    onChange={(e) => setShowIsolated(e.target.checked)}
-                    className="rounded border-gray-300"
-                  />
-                  <span>
-                    Show {isolatedCount} unconnected
-                  </span>
-                </label>
-              </div>
-            </div>
+        {/* Entry points: search + most connected */}
+        <div className="w-80 flex flex-col bg-white rounded-2xl border border-gray-200/60 shadow-lg overflow-hidden">
+          <div className="p-4 border-b border-gray-200/60 space-y-3">
+            <select
+              value={domainFilter}
+              onChange={(e) => {
+                setDomainFilter(e.target.value);
+                setCenterId(null);
+                setTrail([]);
+              }}
+              className="w-full px-3 py-2 border-2 border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm text-gray-700 font-medium bg-white"
+            >
+              <option value="">All domains</option>
+              {(domainsData?.domains ?? []).map((d) => (
+                <option key={d.id} value={d.id}>
+                  {d.name}
+                </option>
+              ))}
+            </select>
+            <input
+              type="text"
+              placeholder="Search entities…"
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              className="w-full px-3 py-2 border-2 border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm text-gray-900 placeholder-gray-400"
+            />
           </div>
 
-          {/* Graph Display */}
-          {isLoading ? (
-            <div className="flex items-center justify-center h-full bg-gradient-to-br from-gray-50 to-blue-50/30">
-              <div className="text-center">
-                <div className="relative">
-                  <div className="animate-spin rounded-full h-16 w-16 border-b-4 border-blue-600 mx-auto mb-4"></div>
-                  <div className="absolute inset-0 animate-ping rounded-full h-16 w-16 border-2 border-blue-400 opacity-20 mx-auto"></div>
+          <div className="px-4 pt-3 pb-1 text-xs font-semibold text-gray-500 uppercase tracking-wide">
+            {searchTerm.trim().length > 1
+              ? searching
+                ? 'Searching…'
+                : `Results (${sidebarList.length})`
+              : 'Most connected'}
+          </div>
+
+          <div className="flex-1 overflow-y-auto px-2 pb-2">
+            {sidebarList.length === 0 && (
+              <p className="text-sm text-gray-400 px-2 py-4">
+                {searchTerm.trim().length > 1 ? 'Nothing matches.' : 'No connected entities yet.'}
+              </p>
+            )}
+            {sidebarList.map(({ node, degree }) => (
+              <button
+                key={node.id}
+                onClick={() => navigateTo(node)}
+                className={`w-full text-left px-3 py-2.5 rounded-lg mb-1 transition-colors ${
+                  node.id === centerId ? 'bg-blue-50 border border-blue-200' : 'hover:bg-gray-50'
+                }`}
+              >
+                <div className="flex items-center gap-2">
+                  <span
+                    className="w-2.5 h-2.5 rounded-full flex-shrink-0"
+                    style={{ background: getNodeColor(node.type) }}
+                  />
+                  <span className="text-sm font-medium text-gray-800 truncate flex-1">
+                    {node.name}
+                  </span>
+                  {degree !== null && (
+                    <span className="text-xs font-mono text-gray-400 flex-shrink-0">{degree}</span>
+                  )}
                 </div>
-                <p className="text-gray-600 font-medium">Loading graph...</p>
-                <p className="text-gray-400 text-sm mt-1">Building your knowledge network</p>
+                <div className="text-xs text-gray-400 ml-4.5 mt-0.5 capitalize pl-4">
+                  {node.type.replace(/_/g, ' ')}
+                </div>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Neighbourhood canvas */}
+        <div className="flex-1 flex flex-col bg-white rounded-2xl border border-gray-200/60 shadow-lg overflow-hidden">
+          {/* Breadcrumb trail + depth */}
+          <div className="px-5 py-3 border-b border-gray-200/60 flex items-center gap-3 flex-wrap min-h-[3.25rem]">
+            <div className="flex items-center gap-1.5 flex-wrap flex-1 text-sm">
+              {trail.length === 0 && <span className="text-gray-400">No entity selected</span>}
+              {trail.map((crumb, i) => (
+                <span key={crumb.id} className="flex items-center gap-1.5">
+                  {i > 0 && <span className="text-gray-300">→</span>}
+                  <button
+                    onClick={() => navigateTo(crumb)}
+                    className={`px-2 py-1 rounded-md max-w-[14rem] truncate ${
+                      crumb.id === centerId
+                        ? 'bg-slate-800 text-white font-semibold'
+                        : 'text-blue-600 hover:bg-blue-50'
+                    }`}
+                    title={crumb.name}
+                  >
+                    {crumb.name}
+                  </button>
+                </span>
+              ))}
+            </div>
+            {centerId && (
+              <div className="flex items-center gap-2 text-sm">
+                <span className="text-gray-500">Hops</span>
+                {([1, 2] as const).map((d) => (
+                  <button
+                    key={d}
+                    onClick={() => setDepth(d)}
+                    className={`w-8 h-8 rounded-lg font-semibold ${
+                      depth === d
+                        ? 'bg-blue-600 text-white'
+                        : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                    }`}
+                  >
+                    {d}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Centre summary */}
+          {centerNode && (
+            <div className="px-5 py-3 border-b border-gray-200/60 bg-gradient-to-r from-slate-50 to-white flex items-start gap-3">
+              <span
+                className="mt-1 w-3 h-3 rounded-full flex-shrink-0"
+                style={{ background: getNodeColor(centerNode.type) }}
+              />
+              <div className="min-w-0">
+                <div className="font-bold text-gray-900 truncate" title={centerNode.name}>
+                  {centerNode.name}
+                </div>
+                <div className="text-xs text-gray-500 capitalize">
+                  {centerNode.type.replace(/_/g, ' ')} ·{' '}
+                  {flowNodes.length > 0 ? flowNodes.length - 1 : 0} related · click a neighbour to
+                  travel
+                </div>
+                {centerNode.description && (
+                  <p className="text-sm text-gray-600 mt-1 line-clamp-2">{centerNode.description}</p>
+                )}
               </div>
             </div>
+          )}
+
+          {!centerId ? (
+            <div className="flex-1 flex items-center justify-center bg-gradient-to-br from-gray-50 to-blue-50/30">
+              <div className="text-center max-w-sm">
+                <div className="w-16 h-16 mx-auto mb-4 bg-white rounded-2xl border border-gray-200 shadow-sm flex items-center justify-center">
+                  <svg className="w-8 h-8 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                  </svg>
+                </div>
+                <p className="text-gray-700 font-semibold">Start from an entity</p>
+                <p className="text-gray-400 text-sm mt-1.5">
+                  Choose one of the most-connected entities on the left, or search for something
+                  specific. Its relationships will fan out here.
+                </p>
+              </div>
+            </div>
+          ) : egoLoading ? (
+            <div className="flex-1 flex items-center justify-center">
+              <div className="animate-spin rounded-full h-12 w-12 border-b-4 border-blue-600" />
+            </div>
           ) : (
-            <ReactFlow
-              nodes={flowNodes}
-              edges={flowEdges}
-              onNodeClick={(_, node) => setSelectedNodeId(node.id)}
-              fitView
-            >
-              <Background />
-              <Controls />
-              <MiniMap />
-            </ReactFlow>
+            <div className="flex-1">
+              <ReactFlow
+                key={`${centerId}-${depth}`}
+                nodes={flowNodes}
+                edges={flowEdges}
+                onNodeClick={(_, node) => {
+                  if (node.id === centerId) return;
+                  const target = ego?.nodes.find((n) => n.id === node.id);
+                  if (target) navigateTo(target);
+                }}
+                fitView
+                fitViewOptions={{ padding: 0.15 }}
+                nodesDraggable={false}
+                nodesConnectable={false}
+              >
+                <Background gap={24} />
+                <Controls showInteractive={false} />
+              </ReactFlow>
+            </div>
           )}
         </div>
 
-        {/* Details Panel */}
-        <div className="w-96 bg-white rounded-2xl border border-gray-200/60 shadow-lg p-6 overflow-y-auto">
-          {selectedNodeData ? (
-            <div className="space-y-6">
-              {/* Header */}
-              <div>
-                <div className="flex items-center space-x-3 mb-4">
-                  <div className="w-10 h-10 bg-gradient-to-br from-blue-500 to-indigo-600 rounded-xl flex items-center justify-center shadow-lg shadow-blue-500/30">
-                    <svg className="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                    </svg>
-                  </div>
-                  <h3 className="text-xl font-bold text-gray-900">Node Details</h3>
-                </div>
+        {/* Context: what is this thing, in the corpus's own words */}
+        {centerId && centerDetail && (
+          <div className="w-80 flex flex-col bg-white rounded-2xl border border-gray-200/60 shadow-lg overflow-hidden">
+            <div className="p-4 border-b border-gray-200/60">
+              <div className="flex items-center gap-2">
+                <span
+                  className="w-3 h-3 rounded-full flex-shrink-0"
+                  style={{ background: getNodeColor(centerDetail.node.type) }}
+                />
+                <h3 className="font-bold text-gray-900 truncate" title={centerDetail.node.name}>
+                  {centerDetail.node.name}
+                </h3>
               </div>
+              <p className="text-xs text-gray-500 mt-1 capitalize">
+                {centerDetail.node.type.replace(/_/g, ' ')}
+                {centerDetail.domain ? ` · ${centerDetail.domain}` : ''}
+              </p>
+            </div>
 
-              {/* Node Info */}
-              <div className="space-y-4">
-                <div className="p-4 bg-gradient-to-r from-blue-50 to-indigo-50/50 rounded-xl border border-blue-100">
-                  <label className="text-xs font-semibold text-blue-700 uppercase tracking-wide">Name</label>
-                  <p className="text-lg font-bold text-gray-900 mt-1">{selectedNodeData.node.name}</p>
-                </div>
-
-                <div className="p-4 bg-gradient-to-r from-purple-50 to-pink-50/50 rounded-xl border border-purple-100">
-                  <label className="text-xs font-semibold text-purple-700 uppercase tracking-wide">Type</label>
-                  <p className="text-base font-semibold text-gray-900 mt-1 capitalize">
-                    {selectedNodeData.node.type}
+            <div className="flex-1 overflow-y-auto p-4 space-y-5 text-sm">
+              <div>
+                <h4 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1.5">
+                  About
+                </h4>
+                {centerDetail.node.description ? (
+                  <p className="text-gray-700 leading-relaxed">{centerDetail.node.description}</p>
+                ) : (
+                  <p className="text-gray-400">
+                    No stored description — the mentions below are what the corpus says about it.
                   </p>
-                </div>
-
-                {selectedNodeData.node.description && (
-                  <div className="p-4 bg-gradient-to-r from-gray-50 to-gray-100/50 rounded-xl border border-gray-200">
-                    <label className="text-xs font-semibold text-gray-700 uppercase tracking-wide">Description</label>
-                    <p className="text-sm text-gray-700 mt-2 leading-relaxed">{selectedNodeData.node.description}</p>
-                  </div>
                 )}
               </div>
 
-              {/* Relationships */}
-              {selectedNodeData.outgoingEdges.length > 0 && (
+              {(centerDetail.mentions?.length ?? 0) > 0 && (
                 <div>
-                  <div className="flex items-center space-x-2 mb-3">
-                    <svg className="w-5 h-5 text-emerald-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7l5 5m0 0l-5 5m5-5H6" />
-                    </svg>
-                    <h4 className="text-sm font-bold text-gray-800">
-                      Outgoing ({selectedNodeData.outgoingEdges.length})
-                    </h4>
-                  </div>
+                  <h4 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">
+                    Mentions in the corpus ({centerDetail.mentions!.length})
+                  </h4>
                   <div className="space-y-2">
-                    {selectedNodeData.outgoingEdges.slice(0, 5).map((edge) => (
-                      <div key={edge.id} className="p-3 bg-emerald-50 rounded-lg border border-emerald-200">
-                        <span className="text-sm font-medium text-emerald-800 capitalize">
-                          {edge.type.replace(/_/g, ' ')}
-                        </span>
-                      </div>
+                    {centerDetail.mentions!.map((m, i) => (
+                      <blockquote
+                        key={i}
+                        className="border-l-2 border-blue-200 bg-blue-50/40 pl-3 pr-2 py-2 rounded-r-lg"
+                      >
+                        <p className="text-gray-700 text-xs leading-relaxed">“{m.text}”</p>
+                        {m.section && (
+                          <span className="inline-block mt-1 text-[10px] font-mono uppercase tracking-wide text-blue-500">
+                            {m.section.replace(/_/g, ' ')}
+                          </span>
+                        )}
+                      </blockquote>
                     ))}
                   </div>
                 </div>
               )}
 
-              {selectedNodeData.incomingEdges.length > 0 && (
+              {(centerDetail.outgoingEdges.length > 0 || centerDetail.incomingEdges.length > 0) && (
                 <div>
-                  <div className="flex items-center space-x-2 mb-3">
-                    <svg className="w-5 h-5 text-orange-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 17l-5-5m0 0l5-5m-5 5h12" />
-                    </svg>
-                    <h4 className="text-sm font-bold text-gray-800">
-                      Incoming ({selectedNodeData.incomingEdges.length})
-                    </h4>
-                  </div>
-                  <div className="space-y-2">
-                    {selectedNodeData.incomingEdges.slice(0, 5).map((edge) => (
-                      <div key={edge.id} className="p-3 bg-orange-50 rounded-lg border border-orange-200">
-                        <span className="text-sm font-medium text-orange-800 capitalize">
-                          {edge.type.replace(/_/g, ' ')}
+                  <h4 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">
+                    Relationships
+                  </h4>
+                  <div className="space-y-1.5">
+                    {centerDetail.outgoingEdges.slice(0, 6).map((e) => (
+                      <div key={e.id} className="flex items-baseline gap-1.5 text-xs">
+                        <span className="text-emerald-700 font-semibold whitespace-nowrap">
+                          {e.type.replace(/_/g, ' ')} →
                         </span>
+                        <span className="text-gray-600 truncate">{e.targetNode?.name ?? '…'}</span>
+                      </div>
+                    ))}
+                    {centerDetail.incomingEdges.slice(0, 6).map((e) => (
+                      <div key={e.id} className="flex items-baseline gap-1.5 text-xs">
+                        <span className="text-orange-700 font-semibold whitespace-nowrap">
+                          ← {e.type.replace(/_/g, ' ')}
+                        </span>
+                        <span className="text-gray-600 truncate">{e.sourceNode?.name ?? '…'}</span>
                       </div>
                     ))}
                   </div>
                 </div>
               )}
             </div>
-          ) : (
-            <div className="flex flex-col items-center justify-center h-full text-center">
-              <div className="w-20 h-20 bg-gradient-to-br from-gray-100 to-gray-200 rounded-2xl flex items-center justify-center mb-4">
-                <svg className="w-10 h-10 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5M7.188 2.239l.777 2.897M5.136 7.965l-2.898-.777M13.95 4.05l-2.122 2.122m-5.657 5.656l-2.12 2.122" />
-                </svg>
-              </div>
-              <p className="text-gray-600 font-medium">Select a node</p>
-              <p className="text-gray-400 text-sm mt-2 max-w-xs">
-                Click on any node in the graph to view its details and relationships
-              </p>
-            </div>
-          )}
-        </div>
+          </div>
+        )}
       </div>
     </div>
   );

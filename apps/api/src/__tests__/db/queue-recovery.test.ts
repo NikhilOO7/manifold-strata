@@ -1,20 +1,22 @@
 /**
- * Startup recovery must not destroy another instance's live work.
+ * Restart recovery under the durable queue.
  *
- * Found in production use, not in review: a second API process starting up
- * (a test run, a second instance, or `tsx watch` reloading on a file change)
- * marked *every* non-terminal job in the shared database as
- * "Interrupted by server restart" — including a job that a different, still-running
- * instance had accepted seconds earlier. Ingestion silently died mid-flight and
- * the user was told their paper had been interrupted by a restart that never
- * touched it.
+ * The contract CHANGED here, deliberately. The old queue held work in process
+ * memory, so the only honest recovery was to fail everything interrupted. The
+ * durable queue's whole reason to exist is a batch that outlives restarts, so
+ * recovery now means:
+ *
+ *   queued, unowned          untouched — it is simply still in the queue
+ *   interrupted, retriable   RE-QUEUED for any instance (attempts < max)
+ *   interrupted, exhausted   failed, honestly
+ *   another instance's live  untouched — its lease is current
+ *
+ * The invariant that survives from the old world: startup must never destroy
+ * another instance's in-flight work. That regression shipped once.
  *
  * Requires Postgres:  pnpm --filter api test:db
  */
 
-// Load the same .env the API loads: the embedding space (provider, model,
-// dimensions) must match the database's vector columns, and a test process
-// that missed it would compute 1536-dim vectors against a 768-dim column.
 import 'dotenv/config';
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -26,35 +28,45 @@ process.env.NODE_ENV = 'test';
 
 const shouldRun = Boolean(dbUrl);
 
-describe('job recovery ownership', { skip: shouldRun ? false : 'TEST_DATABASE_URL not set' }, () => {
+describe('durable queue recovery', { skip: shouldRun ? false : 'TEST_DATABASE_URL not set' }, () => {
   let db: typeof import('../../db').db;
   let schema: typeof import('../../db/schema');
-  let recoverOrphanedJobs: typeof import('../../queue').recoverOrphanedJobs;
-  let INSTANCE_ID: string;
+  let queue: typeof import('../../queue');
 
   const jobIds: string[] = [];
 
-  const makeJob = async (id: string, owner: string | null, leaseExpiresAt: Date | null) => {
+  const makeJob = async (
+    id: string,
+    fields: {
+      status?: import('../../queue').JobStatus;
+      owner?: string | null;
+      leaseExpiresAt?: Date | null;
+      attempts?: number;
+      paperId?: string;
+    } = {}
+  ) => {
     await db.insert(schema.jobs).values({
       id,
       type: 'ingest',
-      status: 'processing',
-      owner,
-      leaseExpiresAt,
-      metadata: { test: true },
+      status: fields.status ?? 'processing',
+      owner: fields.owner === undefined ? null : fields.owner,
+      leaseExpiresAt: fields.leaseExpiresAt ?? null,
+      attempts: fields.attempts ?? 1,
+      paperId: fields.paperId ?? null,
+      metadata: { test: true } as never,
     });
     jobIds.push(id);
   };
 
-  const statusOf = async (id: string) => {
+  const rowOf = async (id: string) => {
     const [row] = await db.select().from(schema.jobs).where(eq(schema.jobs.id, id)).limit(1);
-    return row?.status;
+    return row;
   };
 
   before(async () => {
     ({ db } = await import('../../db'));
     schema = await import('../../db/schema');
-    ({ recoverOrphanedJobs, INSTANCE_ID } = await import('../../queue'));
+    queue = await import('../../queue');
   });
 
   after(async () => {
@@ -64,97 +76,117 @@ describe('job recovery ownership', { skip: shouldRun ? false : 'TEST_DATABASE_UR
     await closeDb();
   });
 
-  test('recovers this instance\'s own interrupted jobs', async () => {
-    // Our in-memory queue is empty at startup by definition, so anything we own
-    // that is still "processing" died with the previous process.
-    const id = 'QUEUETEST-own-job';
-    await makeJob(id, INSTANCE_ID, new Date(Date.now() + 60_000));
+  test('own interrupted job is RE-QUEUED, not failed — the durable-queue payoff', async () => {
+    const id = 'RECOVERTEST-own-retriable';
+    await makeJob(id, { owner: queue.INSTANCE_ID, leaseExpiresAt: new Date(Date.now() + 60_000), attempts: 1 });
 
-    const result = await recoverOrphanedJobs();
-    assert.ok(result.ownJobs >= 1);
-    assert.equal(await statusOf(id), 'failed');
+    const result = await queue.recoverOnStartup();
+    assert.ok(result.requeued >= 1);
+
+    const row = await rowOf(id);
+    assert.equal(row.status, 'queued');
+    assert.equal(row.owner, null, 'released for any instance to claim');
+    assert.equal(row.leaseExpiresAt, null);
   });
 
-  test('leaves a live job owned by ANOTHER instance untouched', async () => {
-    // The regression. Its owner is alive and renewing, so it is still running.
-    const id = 'QUEUETEST-other-live';
-    await makeJob(id, 'other-host:9999', new Date(Date.now() + 60_000));
-
-    await recoverOrphanedJobs();
-    assert.equal(
-      await statusOf(id),
-      'processing',
-      'another instance\'s in-flight job must survive our startup'
-    );
-  });
-
-  test('recovers a job whose owner stopped renewing its lease', async () => {
-    // The safety net: a permanently-dead instance must not strand work forever.
-    const id = 'QUEUETEST-expired-lease';
-    await makeJob(id, 'dead-host:9999', new Date(Date.now() - 60_000));
-
-    const result = await recoverOrphanedJobs();
-    assert.ok(result.expiredLeases >= 1);
-    assert.equal(await statusOf(id), 'failed');
-  });
-
-  test('recovers pre-ownership rows that have no owner recorded', async () => {
-    const id = 'QUEUETEST-legacy';
-    await makeJob(id, null, null);
-
-    await recoverOrphanedJobs();
-    assert.equal(await statusOf(id), 'failed');
-  });
-
-  test('does not touch jobs that already reached a terminal state', async () => {
-    const id = 'QUEUETEST-terminal';
-    await db.insert(schema.jobs).values({
-      id,
-      type: 'ingest',
-      status: 'completed',
-      owner: INSTANCE_ID,
-      progress: 'all good',
+  test('an interrupted job out of attempts fails honestly', async () => {
+    const id = 'RECOVERTEST-own-exhausted';
+    await makeJob(id, {
+      owner: queue.INSTANCE_ID,
+      leaseExpiresAt: new Date(Date.now() + 60_000),
+      attempts: queue.MAX_JOB_ATTEMPTS,
     });
-    jobIds.push(id);
 
-    await recoverOrphanedJobs();
-    assert.equal(await statusOf(id), 'completed');
+    await queue.recoverOnStartup();
+    const row = await rowOf(id);
+    assert.equal(row.status, 'failed');
+    assert.match(row.error ?? '', /out of retry attempts/);
   });
 
-  test('a paper still owned by another instance\'s live job keeps its in-progress status', async () => {
+  test('a queued unowned job needs no recovery at all', async () => {
+    const id = 'RECOVERTEST-queued-durable';
+    await makeJob(id, { status: 'queued', owner: null, attempts: 0 });
+
+    await queue.recoverOnStartup();
+    const row = await rowOf(id);
+    assert.equal(row.status, 'queued');
+    assert.equal(row.attempts, 0, 'untouched — it is simply still in the queue');
+  });
+
+  test("another instance's live job is untouched", async () => {
+    // The invariant that must survive the redesign: this regression shipped once.
+    const id = 'RECOVERTEST-other-live';
+    await makeJob(id, { owner: 'other-host:9999', leaseExpiresAt: new Date(Date.now() + 60_000) });
+
+    await queue.recoverOnStartup();
+    assert.equal((await rowOf(id)).status, 'processing');
+  });
+
+  test("a dead instance's job (expired lease) is re-queued by the reaper", async () => {
+    const id = 'RECOVERTEST-expired-lease';
+    await makeJob(id, { owner: 'dead-host:9999', leaseExpiresAt: new Date(Date.now() - 60_000), attempts: 1 });
+
+    const result = await queue.reapExpiredJobs();
+    assert.ok(result.requeued >= 1);
+    const row = await rowOf(id);
+    assert.equal(row.status, 'queued');
+    assert.equal(row.owner, null);
+  });
+
+  test('terminal jobs are never revisited', async () => {
+    const id = 'RECOVERTEST-terminal';
+    await makeJob(id, { status: 'completed', owner: queue.INSTANCE_ID });
+
+    await queue.recoverOnStartup();
+    assert.equal((await rowOf(id)).status, 'completed');
+  });
+
+  test('a paper whose job was re-queued keeps its in-progress status', async () => {
+    // The requeue runs in the same transaction before the paper sweep, so a
+    // resumable paper's job is non-terminal again by the time the sweep looks.
     const [paper] = await db
       .insert(schema.papers)
-      .values({
-        title: 'QUEUETEST Live Paper',
-        domain: 'nlp',
-        processingStatus: 'extracting_entities',
-      })
+      .values({ title: 'RECOVERTEST resumable', domain: 'nlp', processingStatus: 'extracting_entities' })
       .returning();
-
-    const id = 'QUEUETEST-other-live-paper';
-    await db.insert(schema.jobs).values({
-      id,
-      type: 'process',
-      status: 'processing',
-      paperId: paper.id,
-      owner: 'other-host:9999',
+    const id = 'RECOVERTEST-paper-resumable';
+    await makeJob(id, {
+      owner: queue.INSTANCE_ID,
       leaseExpiresAt: new Date(Date.now() + 60_000),
+      attempts: 1,
+      paperId: paper.id,
     });
-    jobIds.push(id);
 
     try {
-      await recoverOrphanedJobs();
-      const [after] = await db
-        .select()
-        .from(schema.papers)
-        .where(eq(schema.papers.id, paper.id));
+      await queue.recoverOnStartup();
+      const [after] = await db.select().from(schema.papers).where(eq(schema.papers.id, paper.id));
       assert.equal(
         after.processingStatus,
         'extracting_entities',
-        'a paper being worked on elsewhere must not be marked failed'
+        'the job will resume; failing the paper would lie to the dashboard'
       );
     } finally {
-      await db.delete(schema.jobs).where(eq(schema.jobs.id, id));
+      await db.delete(schema.papers).where(eq(schema.papers.id, paper.id));
+    }
+  });
+
+  test('a paper whose job exhausted its attempts is reset to failed', async () => {
+    const [paper] = await db
+      .insert(schema.papers)
+      .values({ title: 'RECOVERTEST dead', domain: 'nlp', processingStatus: 'extracting_entities' })
+      .returning();
+    const id = 'RECOVERTEST-paper-dead';
+    await makeJob(id, {
+      owner: queue.INSTANCE_ID,
+      leaseExpiresAt: new Date(Date.now() + 60_000),
+      attempts: queue.MAX_JOB_ATTEMPTS,
+      paperId: paper.id,
+    });
+
+    try {
+      await queue.recoverOnStartup();
+      const [after] = await db.select().from(schema.papers).where(eq(schema.papers.id, paper.id));
+      assert.equal(after.processingStatus, 'failed');
+    } finally {
       await db.delete(schema.papers).where(eq(schema.papers.id, paper.id));
     }
   });

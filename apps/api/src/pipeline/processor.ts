@@ -1,12 +1,13 @@
 import { db } from '../db';
 import { papers, nodes, edges, sources, nodeVectors, propositions } from '../db/schema';
-import { eq, ilike, inArray, and, desc, sql } from 'drizzle-orm';
+import { eq, inArray, and, desc, sql } from 'drizzle-orm';
 import { resolveStoredDomain } from '../domains';
 import { domainWhere } from '../domains/filter';
 import { extractEntitiesAndRelationships } from '../agents/extractor';
 import { resolveEntities } from '../agents/resolver';
 import { validateRelationships } from '../agents/validator';
 import { resolveEntitiesEmbed } from '../knowledge-field/resolve-embed';
+import { createCandidateSource } from '../knowledge-field/resolve-candidates';
 import { validateRelationshipsRules } from '../knowledge-field/validate-rules';
 import { embed, embedModel, embedSpaceId } from '../services/embeddings';
 import { LLMUnavailableError } from '../services/llm';
@@ -142,7 +143,6 @@ export async function processPaper(paperId: string): Promise<ProcessingStats> {
       .where(eq(papers.id, paperId));
 
     const entityMap = new Map<string, string>();
-    let candidateCapWarned = false;
     const chunkErrors: string[] = [];
     let consecutiveUnavailable = 0;
 
@@ -182,48 +182,35 @@ export async function processPaper(paperId: string): Promise<ProcessingStats> {
           continue;
         }
 
-        // Scoped to this paper's domain — the isolation boundary for resolution.
-        // Deterministically ordered so the candidate window is reproducible.
-        const existingNodes = await db
-          .select()
-          .from(nodes)
-          .where(domainWhere(nodes.domain, domain.id))
-          .orderBy(desc(nodes.createdAt), desc(nodes.id))
-          .limit(RESOLUTION_CANDIDATE_LIMIT);
-
-        if (existingNodes.length === RESOLUTION_CANDIDATE_LIMIT && !candidateCapWarned) {
-          candidateCapWarned = true;
-          console.warn(
-            `[processor] domain "${domain.id}" has at least ${RESOLUTION_CANDIDATE_LIMIT} nodes; ` +
-              `entity resolution only compares against the ${RESOLUTION_CANDIDATE_LIMIT} most recent. ` +
-              `Older entities may be duplicated. Raise RESOLUTION_CANDIDATE_LIMIT or move to an ANN index.`
-          );
-        }
-
         // Resolve entities: embedding-based (field) or LLM (legacy).
+        //
+        // The field path asks storage for candidates through indexed lookups
+        // scoped to this paper's domain — the isolation boundary for resolution.
+        // It used to preload the 2000 most recent nodes and their vectors and
+        // compare in JS, which meant a domain larger than that window resolved
+        // against a *slice* of itself and forked entities it had already seen.
+        // See resolve-candidates.ts.
         let resolverOutput;
         let vectorsByName = new Map<string, number[]>();
+        // Only the legacy prompt-based path needs a materialised node list.
+        let legacyNodes: Array<typeof nodes.$inferSelect> = [];
         if (mode === 'field') {
-          const existingIds = existingNodes.map((n) => n.id);
-          const nodeVectorMap = new Map<string, number[]>();
-          if (existingIds.length > 0) {
-            const vecRows = await db
-              .select()
-              .from(nodeVectors)
-              .where(inArray(nodeVectors.nodeId, existingIds));
-            for (const v of vecRows) {
-              if (v.embeddingVec) nodeVectorMap.set(v.nodeId, v.embeddingVec as number[]);
-            }
-          }
           const fieldOut = await resolveEntitiesEmbed(
             extractorOutput,
-            existingNodes as any,
-            nodeVectorMap
+            createCandidateSource(domain.id)
           );
           resolverOutput = fieldOut;
           vectorsByName = fieldOut.vectorsByName;
         } else {
-          resolverOutput = await resolveEntities(extractorOutput, existingNodes);
+          // The legacy LLM resolver still takes a list; it is bounded by prompt
+          // size, not by an index, so the window is inherent to that design.
+          legacyNodes = await db
+            .select()
+            .from(nodes)
+            .where(domainWhere(nodes.domain, domain.id))
+            .orderBy(desc(nodes.createdAt), desc(nodes.id))
+            .limit(RESOLUTION_CANDIDATE_LIMIT);
+          resolverOutput = await resolveEntities(extractorOutput, legacyNodes);
         }
         console.log(`Resolved ${resolverOutput.resolvedEntities.length} entities`);
         if (resolverOutput.resolvedRelationships.length > 0) {
@@ -235,12 +222,17 @@ export async function processPaper(paperId: string): Promise<ProcessingStats> {
 
         for (const entity of resolverOutput.resolvedEntities) {
           if (entity.isNew && !entityMap.has(entity.canonicalName.toLowerCase())) {
+            // `eq`, not `ilike`. Both sides are already lowercased, so these ask
+            // the identical question — but ilike cannot use the btree index:
+            // measured on 100k nodes it was a Seq Scan discarding all 100,000
+            // rows (plan cost 3039) against an Index Scan at cost 12, and this
+            // runs once per newly-seen entity per chunk.
             const existingByName = await db
               .select()
               .from(nodes)
               .where(
                 and(
-                  ilike(nodes.normalizedName, entity.canonicalName.toLowerCase()),
+                  eq(nodes.normalizedName, entity.canonicalName.toLowerCase()),
                   domainWhere(nodes.domain, domain.id)
                 )
               )
@@ -290,17 +282,19 @@ export async function processPaper(paperId: string): Promise<ProcessingStats> {
           }
         }
 
-        const graphContext = {
-          nodes: existingNodes.slice(0, 50),
-          paperDate: paper.publicationDate,
-        };
-
+        // The rule validator needs a name -> type map for every edge endpoint.
+        // It used to receive an arbitrary slice of the domain for that, which was
+        // both unbounded-in-principle and beside the point: the resolver already
+        // adds every relationship endpoint as a candidate and stamps each one
+        // with its *stored* type when it matched an existing node. So the
+        // resolved set is the authoritative, complete answer — the extra rows
+        // could only supply types for names no edge referenced.
         const validationOutput = mode === 'field'
-          ? validateRelationshipsRules(resolverOutput, {
-              nodes: existingNodes as any,
+          ? validateRelationshipsRules(resolverOutput, { paperDate: paper.publicationDate })
+          : await validateRelationships(resolverOutput, {
+              nodes: legacyNodes.slice(0, 50),
               paperDate: paper.publicationDate,
-            })
-          : await validateRelationships(resolverOutput, graphContext);
+            });
         console.log(`Validated: ${validationOutput.accepted.length} accepted, ${validationOutput.rejected.length} rejected`);
 
         stats.relationshipsRejected += validationOutput.rejected.length;

@@ -133,9 +133,31 @@ export const sources = pgTable('sources', {
   paperIdIdx: index('sources_paper_id_idx').on(table.paperId),
 }));
 
-// Durable background-job records. Replaces the previous in-memory Map so job
-// status survives server restarts and is queryable across processes. The
-// in-process worker (apps/api/src/queue) claims and runs these.
+/**
+ * A batch: one bulk request, many jobs.
+ *
+ * "100 documents in one request" needs an entity the caller can hold on to.
+ * Progress and completion are always COMPUTED from the member jobs, never
+ * denormalised onto this row — counters that are written twice drift, and a
+ * batch that claims 100/100 while a job row says `failed` is worse than no
+ * batch tracking at all.
+ */
+export const batches = pgTable('batches', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  note: text('note'),
+  domain: text('domain'),
+  /** Number of documents submitted — fixed at creation. */
+  total: integer('total').notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+// Durable background-job records: the QUEUE ITSELF, not a status mirror.
+//
+// Previously a job row only mirrored the status of a closure held in the
+// worker's memory, which meant a queued job died with its process — fatal for a
+// batch that runs 20+ hours on this hardware. Now workers CLAIM rows from this
+// table (FOR UPDATE SKIP LOCKED), so any instance can pick up any queued job,
+// and a restart resumes the backlog instead of orphaning it.
 export const jobs = pgTable('jobs', {
   id: text('id').primaryKey(),                     // "job-{timestamp}-{counter}-{random}"
   type: text('type').notNull(),                    // 'ingest' | 'process'
@@ -153,12 +175,16 @@ export const jobs = pgTable('jobs', {
   // Lease renewed while the job runs. If an instance dies for good, its lease
   // lapses and any instance may then recover the job.
   leaseExpiresAt: timestamp('lease_expires_at'),
+  /** Times this job has been claimed. Retried until MAX_JOB_ATTEMPTS, then failed. */
+  attempts: integer('attempts').default(0).notNull(),
+  batchId: uuid('batch_id').references(() => batches.id, { onDelete: 'set null' }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 }, (table) => ({
   statusIdx: index('jobs_status_idx').on(table.status),
   paperIdIdx: index('jobs_paper_id_idx').on(table.paperId),
   ownerIdx: index('jobs_owner_idx').on(table.owner),
+  batchIdx: index('jobs_batch_idx').on(table.batchId),
 }));
 
 // --- Identity, authorization, audit ----------------------------------------

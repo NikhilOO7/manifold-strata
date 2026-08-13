@@ -4,7 +4,7 @@ import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import { serve } from '@hono/node-server';
 import { sql } from 'drizzle-orm';
-import { db } from './db';
+import { db, closeDb } from './db';
 import { papersRouter } from './routes/papers';
 import { graphRouter } from './routes/graph';
 import { ingestRouter } from './routes/ingest';
@@ -13,7 +13,15 @@ import { domainsRouter } from './routes/domains';
 import { adminRouter } from './routes/admin';
 import { authenticate, authEnabled } from './middleware/auth';
 import { rateLimit } from './middleware/rate-limit';
-import { recoverOrphanedJobs, INSTANCE_ID } from './queue';
+import {
+  recoverOnStartup,
+  startWorkers,
+  stopWorkers,
+  queueDepth,
+  inFlightJobIds,
+  INSTANCE_ID,
+} from './queue';
+import { registerDefaultHandlers } from './jobs';
 import { checkLLMHealth, warmupModel, llmProvider, llmModel } from './services/llm';
 import { routingTable, routingAdvice } from './services/model-router';
 import { checkEmbedHealth } from './services/embeddings';
@@ -99,6 +107,7 @@ app.get('/health', async (c) => {
       status: healthy ? 'ok' : 'degraded',
       timestamp: new Date().toISOString(),
       services: { database, vectors, llm, embeddings },
+      queue: database.ok ? await queueDepth().catch(() => null) : null,
       models: {
         routes: routingTable().map((r) => ({
           role: r.role,
@@ -233,15 +242,17 @@ async function startServer() {
   }
 
   try {
-    const recovered = await recoverOrphanedJobs();
-    const total = recovered.ownJobs + recovered.expiredLeases;
-    if (total > 0) {
+    const recovered = await recoverOnStartup();
+    if (recovered.requeued + recovered.failed > 0) {
       console.log(
-        `✓ Recovered ${total} interrupted job(s) — ${recovered.ownJobs} own, ` +
-          `${recovered.expiredLeases} from expired leases; ${recovered.papers} paper(s) reset`
+        `✓ Recovery: ${recovered.requeued} interrupted job(s) RE-QUEUED for retry, ` +
+          `${recovered.failed} out of attempts → failed, ${recovered.papersReset} paper(s) reset`
       );
     }
-    console.log(`  Instance id: ${INSTANCE_ID} (owns its jobs; other instances' work untouched)`);
+    console.log(`  Instance id: ${INSTANCE_ID} (queued work is durable; restarts resume it)`);
+
+    registerDefaultHandlers();
+    startWorkers();
   } catch (err) {
     console.warn(
       '! Could not recover orphaned jobs — is the DB migrated? Run `pnpm db:push`.',
@@ -253,7 +264,76 @@ async function startServer() {
   console.log(`  → API docs: http://localhost:${port}/`);
   console.log(`  → Health: http://localhost:${port}/health\n`);
 
-  serve({ fetch: app.fetch, port });
+  const server = serve({ fetch: app.fetch, port });
+  installShutdownHandlers(server);
+}
+
+/**
+ * Shut down on a signal instead of dying on one.
+ *
+ * Nothing handled SIGTERM before, which made every deploy indistinguishable from
+ * a crash: connections cut mid-response, the Postgres pool dropped without
+ * closing, and in-flight jobs went to lease-expiry recovery even when they were
+ * two seconds from finishing. A deploy is the most frequent "failure" a service
+ * experiences, so it is the one worth handling properly.
+ *
+ * Order matters. Stop accepting new requests first, so nothing new arrives to be
+ * abandoned. Then stop claiming and let in-flight jobs land (see `stopWorkers` —
+ * it does not release live claims, because that would let another instance run
+ * the same extraction concurrently). Close the pool last, once nothing else
+ * needs it.
+ *
+ * A second signal exits immediately: an operator pressing Ctrl-C twice means it,
+ * and a shutdown that cannot be interrupted is its own kind of outage.
+ */
+function installShutdownHandlers(server: { close: (cb?: (err?: Error) => void) => void }): void {
+  let shuttingDown = false;
+
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) {
+      console.log(`\n${signal} again — exiting now.`);
+      process.exit(130);
+    }
+    shuttingDown = true;
+    console.log(`\n${signal} received — shutting down.`);
+
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, 5_000);
+      server.close(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+    console.log('  ✓ HTTP server closed to new connections');
+
+    try {
+      const { drained, inFlight } = await stopWorkers();
+      console.log(`  ✓ Workers stopped — ${drained} job(s) finished during drain`);
+      if (inFlight > 0) {
+        // Named, not summarised: an operator reading this after a bad deploy
+        // needs to know exactly which work is coming back, and when.
+        console.log(
+          `  · ${inFlight} job(s) still running and left leased: ${inFlightJobIds().join(', ')}`
+        );
+        console.log('    They are re-queued automatically once the lease expires.');
+      }
+    } catch (err) {
+      console.warn('  ! Worker drain failed:', err instanceof Error ? err.message : err);
+    }
+
+    try {
+      await closeDb();
+      console.log('  ✓ Database pool closed');
+    } catch (err) {
+      console.warn('  ! Database close failed:', err instanceof Error ? err.message : err);
+    }
+
+    console.log('Goodbye.');
+    process.exit(0);
+  };
+
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  process.on('SIGINT', () => void shutdown('SIGINT'));
 }
 
 // Only boot when run as the entrypoint, so tests can import `app` without

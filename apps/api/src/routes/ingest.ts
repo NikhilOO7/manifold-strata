@@ -1,25 +1,25 @@
 import { Hono } from 'hono';
+import { desc, eq, inArray, sql } from 'drizzle-orm';
 import { db } from '../db';
-import { papers, authors, paperAuthors } from '../db/schema';
-import { eq } from 'drizzle-orm';
-import { fetchAndExtractPDF } from '../services/pdf';
-import { TIMEOUTS } from '../services/http';
-import { politeFetch } from '../services/polite-fetch';
+import { papers, batches, jobs } from '../db/schema';
 import { processPaper } from '../pipeline/processor';
-import { paperQueue, createJob, setJobStatus, getJob } from '../queue';
+import {
+  createJob,
+  getJob,
+  pendingJobCount,
+  MAX_PENDING_JOBS,
+} from '../queue';
 import { requireDomain, requireScopeOn } from '../middleware/auth';
-import { getConnector, listConnectors, UnknownConnectorError, ConnectorInputError, ConnectorSourceError } from '../connectors';
-import { routeError } from './errors';
+import {
+  getConnector,
+  listConnectors,
+  UnknownConnectorError,
+  ConnectorInputError,
+  ConnectorSourceError,
+} from '../connectors';
+import { routeError, isUuid } from './errors';
 
 export const ingestRouter = new Hono();
-
-interface ArxivMetadata {
-  title: string;
-  abstract: string;
-  authors: string[];
-  published: string;
-  pdfUrl: string;
-}
 
 /**
  * arXiv identifiers, both schemes:
@@ -28,9 +28,7 @@ interface ArxivMetadata {
  *
  * The id is interpolated into two upstream URLs, so it is validated as a *format*
  * rather than merely trimmed — an unchecked value could otherwise inject query
- * parameters into the metadata request or path segments into the PDF URL. It also
- * turns a typo into a 400 at the edge instead of a confusing failure three
- * network calls deep.
+ * parameters into the metadata request or path segments into the PDF URL.
  */
 const ARXIV_ID_PATTERN = /^(\d{4}\.\d{4,5}(v\d+)?|[a-z-]+(\.[A-Z]{2})?\/\d{7}(v\d+)?)$/;
 
@@ -42,90 +40,44 @@ export function normalizeArxivId(raw: unknown): string | null {
   return ARXIV_ID_PATTERN.test(cleaned) ? cleaned : null;
 }
 
-async function fetchArxivMetadata(arxivId: string): Promise<ArxivMetadata> {
-  const apiUrl = `https://export.arxiv.org/api/query?id_list=${encodeURIComponent(arxivId)}`;
-
-  // Throttled and retried: arXiv asks for a gap between requests, and bulk
-  // ingest would otherwise open `JOB_CONCURRENCY` lookups simultaneously and
-  // convert its own impatience into a wall of failed jobs.
-  const response = await politeFetch(
-    apiUrl,
-    {
-      headers: {
-        Accept: 'application/atom+xml',
-        // arXiv's API guidelines ask clients to identify themselves, and
-        // anonymous callers are throttled far more aggressively. The PDF fetch
-        // has always sent one; the metadata call did not, which is a large part
-        // of why bulk ingest kept earning 429s.
-        'User-Agent': process.env.ARXIV_USER_AGENT || 'Manifold/1.0 (knowledge-graph ingestion)',
-      },
-    },
-    { timeoutMs: TIMEOUTS.metadata, label: 'arXiv API' }
-  );
-  if (!response.ok) {
-    if (response.status === 429) {
-      throw new Error(
-        'arXiv is rate-limiting this client and did not relent after several retries. ' +
-          'Reduce JOB_CONCURRENCY or raise ARXIV_MIN_INTERVAL_MS, then retry.'
-      );
-    }
-    throw new Error(`arXiv API request failed: ${response.status} ${response.statusText}`);
-  }
-
-  const xmlText = await response.text();
-
-  const titleMatch = xmlText.match(/<title>([^<]+)<\/title>/g);
-  // [0] is the feed title, [1] is the entry title.
-  const title =
-    titleMatch && titleMatch.length > 1
-      ? titleMatch[1].replace(/<\/?title>/g, '').trim()
-      : `Paper ${arxivId}`;
-
-  const summaryMatch = xmlText.match(/<summary>([^]*?)<\/summary>/);
-  const abstract = summaryMatch ? summaryMatch[1].trim().replace(/\s+/g, ' ') : '';
-
-  // arXiv answers an unknown id with HTTP 200 and an entry literally titled
-  // "Error". Without this check the corpus silently gains a paper called "Error"
-  // whose "abstract" is the API's complaint.
-  if (/^error$/i.test(title)) {
-    throw new Error(
-      `arXiv has no paper "${arxivId}"${abstract ? ` (${abstract.slice(0, 200)})` : ''}`
-    );
-  }
-
-  const authorMatches = xmlText.matchAll(/<author>\s*<name>([^<]+)<\/name>/g);
-  const authorsList: string[] = [];
-  for (const match of authorMatches) {
-    authorsList.push(match[1].trim());
-  }
-
-  const publishedMatch = xmlText.match(/<published>([^<]+)<\/published>/);
-  const published = publishedMatch ? publishedMatch[1].split('T')[0] : '';
-
-  return {
-    title: title.replace(/\s+/g, ' ').trim(),
-    abstract,
-    authors: authorsList,
-    published,
-    pdfUrl: `https://arxiv.org/pdf/${encodeURIComponent(arxivId)}.pdf`,
-  };
+let jobCounter = 0;
+function newJobId(): string {
+  // Counter included because Date.now() has millisecond resolution and bulk
+  // ingest creates rows in a tight loop; two jobs sharing an id would overwrite
+  // each other's status rows.
+  jobCounter = (jobCounter + 1) % 1_000_000;
+  return `job-${Date.now()}-${jobCounter}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 /**
- * Postgres unique-violation, i.e. the paper already exists.
+ * Admission control.
  *
- * The driver error is wrapped by Drizzle, so the SQLSTATE lives on `cause`, not
- * on the object thrown. Checking only the top level meant every duplicate ingest
- * surfaced as an unhandled `DrizzleQueryError` with the whole INSERT statement in
- * the log, instead of the "already exists" the code was written to report.
+ * The queue is durable, which cuts both ways: nothing is ever silently lost, so
+ * nothing stops a caller from piling up work either. Without a ceiling, a
+ * scripted loop of bulk requests builds a backlog measured in GPU-days and every
+ * later caller's batch quietly lands behind it. Refusing loudly at a bound —
+ * with the current depth in the response — is the honest alternative.
  */
-function isUniqueViolation(err: unknown): boolean {
-  for (let current = err, depth = 0; current && depth < 5; depth++) {
-    if (typeof current === 'object' && (current as { code?: string }).code === '23505') return true;
-    current = (current as { cause?: unknown }).cause;
+async function admit(c: Parameters<typeof routeError>[0], incoming: number) {
+  const pending = await pendingJobCount();
+  if (pending + incoming > MAX_PENDING_JOBS) {
+    return c.json(
+      {
+        error: 'Queue is full',
+        message:
+          `Admitting ${incoming} job(s) would exceed the pending-work ceiling ` +
+          `(${pending} pending, limit ${MAX_PENDING_JOBS}). Retry when the backlog drains, ` +
+          'or raise MAX_PENDING_JOBS.',
+        pending,
+        limit: MAX_PENDING_JOBS,
+      },
+      429
+    );
   }
-  return false;
+  return null;
 }
+
+// --- Single-document ingest ---------------------------------------------------
 
 ingestRouter.post('/arxiv', async (c) => {
   try {
@@ -145,9 +97,6 @@ ingestRouter.post('/arxiv', async (c) => {
       );
     }
 
-    // Resolved (and persisted) rather than passed through raw: storing an
-    // unregistered string here is what let a paper claim one domain while its
-    // extracted entities were stamped with another.
     const resolvedDomain = requireDomain(c, domain, 'ingest.read').id;
 
     const existing = await db.select().from(papers).where(eq(papers.arxivId, arxivId)).limit(1);
@@ -158,191 +107,21 @@ ingestRouter.post('/arxiv', async (c) => {
       );
     }
 
+    const full = await admit(c, 1);
+    if (full) return full;
+
+    // The route's entire job is this row. A worker — this instance or any other,
+    // now or after a restart — claims and runs it. Nothing is held in memory.
     const jobId = newJobId();
     await createJob(jobId, 'ingest', {
       metadata: { arxivId, autoProcess, domain: resolvedDomain },
     });
-
-    paperQueue.enqueue(jobId, () => processArxivPaper(jobId, arxivId, autoProcess, resolvedDomain));
 
     return c.json({ jobId, status: 'queued', domain: resolvedDomain }, 202);
   } catch (error) {
     return routeError(c, error, 'Failed to create ingestion job');
   }
 });
-
-let jobCounter = 0;
-function newJobId(): string {
-  // Counter included because Date.now() has millisecond resolution and bulk
-  // ingest enqueues in a tight loop; two jobs sharing an id would overwrite each
-  // other's status rows.
-  jobCounter = (jobCounter + 1) % 1_000_000;
-  return `job-${Date.now()}-${jobCounter}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-async function processArxivPaper(
-  jobId: string,
-  arxivId: string,
-  autoProcess: boolean,
-  domainId: string
-) {
-  try {
-    await setJobStatus(jobId, {
-      status: 'fetching_metadata',
-      progress: 'Fetching paper metadata from arXiv...',
-    });
-
-    const metadata = await fetchArxivMetadata(arxivId);
-    console.log(`Fetched metadata for: ${metadata.title}`);
-
-    await setJobStatus(jobId, { status: 'downloading_pdf', progress: 'Downloading PDF...' });
-
-    let rawText = '';
-    let pdfError: string | null = null;
-    try {
-      const pdfContent = await fetchAndExtractPDF(metadata.pdfUrl);
-      rawText = pdfContent.text;
-      console.log(`Extracted ${rawText.length} characters from PDF`);
-    } catch (err) {
-      pdfError = err instanceof Error ? err.message : String(err);
-      console.warn(`Failed to extract PDF, continuing with metadata only: ${pdfError}`);
-    }
-
-    await setJobStatus(jobId, { status: 'extracting_text', progress: 'Saving to database...' });
-
-    let paper: typeof papers.$inferSelect;
-    try {
-      [paper] = await db
-        .insert(papers)
-        .values({
-          title: metadata.title,
-          abstract: metadata.abstract,
-          arxivId,
-          pdfUrl: metadata.pdfUrl,
-          publicationDate: metadata.published || null,
-          rawText: rawText || null,
-          domain: domainId,
-          processed: false,
-        })
-        .returning();
-    } catch (err) {
-      // The pre-flight duplicate check in the route is advisory only — two
-      // concurrent ingests of the same id both pass it. The unique index is the
-      // real guard; report the race as the duplicate it is, not a 500.
-      if (isUniqueViolation(err)) {
-        await setJobStatus(jobId, {
-          status: 'failed',
-          error: `Paper ${arxivId} was ingested concurrently by another request.`,
-        });
-        return;
-      }
-      throw err;
-    }
-
-    await linkAuthors(paper.id, metadata.authors);
-
-    if (!autoProcess) {
-      await setJobStatus(jobId, {
-        status: 'completed',
-        paperId: paper.id,
-        progress: pdfError
-          ? `Saved without full text (${pdfError}). Extraction pipeline not run.`
-          : 'Saved. Run POST /api/papers/:id/process to extract the graph.',
-      });
-      return;
-    }
-
-    if (!rawText) {
-      // autoProcess was requested but there is nothing to process. Saying
-      // "completed" here would claim a graph was built from a paper we never read.
-      await setJobStatus(jobId, {
-        status: 'failed',
-        paperId: paper.id,
-        error: `Paper saved, but its text could not be extracted, so the pipeline did not run: ${
-          pdfError ?? 'no text in PDF'
-        }`,
-      });
-      return;
-    }
-
-    await setJobStatus(jobId, {
-      status: 'processing',
-      progress: 'Running extraction pipeline...',
-      paperId: paper.id,
-    });
-
-    try {
-      const stats = await processPaper(paper.id);
-      await setJobStatus(jobId, {
-        status: 'completed',
-        paperId: paper.id,
-        progress:
-          `Processed ${stats.chunksProcessed} chunk(s): ` +
-          `${stats.entitiesCreated} entities, ${stats.relationshipsCreated} relationships` +
-          (stats.chunksFailed > 0 ? `, ${stats.chunksFailed} chunk(s) failed` : ''),
-      });
-    } catch (processError) {
-      // Previously this set status 'completed' with a note in `progress`, so a
-      // failed pipeline reported success to every poller and to the UI.
-      console.error('Error in processing pipeline:', processError);
-      await setJobStatus(jobId, {
-        status: 'failed',
-        paperId: paper.id,
-        error: `Paper saved, but processing failed: ${
-          processError instanceof Error ? processError.message : String(processError)
-        }`,
-      });
-    }
-  } catch (error) {
-    console.error('Error ingesting paper:', error);
-    await setJobStatus(jobId, {
-      status: 'failed',
-      error: error instanceof Error ? error.message : 'Unknown error',
-    });
-  }
-}
-
-async function linkAuthors(paperId: string, authorNames: string[]): Promise<void> {
-  for (let i = 0; i < authorNames.length; i++) {
-    const authorName = authorNames[i];
-    const normalizedName = authorName.toLowerCase().trim();
-    if (!normalizedName) continue;
-
-    let [author] = await db
-      .select()
-      .from(authors)
-      .where(eq(authors.normalizedName, normalizedName))
-      .limit(1);
-
-    if (!author) {
-      try {
-        [author] = await db
-          .insert(authors)
-          .values({ name: authorName, normalizedName })
-          .returning();
-      } catch (err) {
-        if (!isUniqueViolation(err)) throw err;
-        [author] = await db
-          .select()
-          .from(authors)
-          .where(eq(authors.normalizedName, normalizedName))
-          .limit(1);
-      }
-    }
-
-    if (!author) continue;
-
-    await db
-      .insert(paperAuthors)
-      .values({
-        paperId,
-        authorId: author.id,
-        position: i + 1,
-        isCorresponding: i === 0,
-      })
-      .onConflictDoNothing();
-  }
-}
 
 ingestRouter.get('/status/:jobId', async (c) => {
   try {
@@ -356,10 +135,12 @@ ingestRouter.get('/status/:jobId', async (c) => {
   }
 });
 
+// --- Batch ingest -------------------------------------------------------------
+
 ingestRouter.post('/bulk', async (c) => {
   try {
     const body = await c.req.json().catch(() => ({}));
-    const { arxivIds, autoProcess = false, domain } = body ?? {};
+    const { arxivIds, autoProcess = false, domain, note } = body ?? {};
 
     requireScopeOn(c, 'write', 'ingest.bulk');
 
@@ -372,7 +153,7 @@ ingestRouter.post('/bulk', async (c) => {
 
     const resolvedDomain = requireDomain(c, domain, 'ingest.read').id;
 
-    // Validate the whole batch before enqueueing any of it, so a single typo
+    // Validate the whole batch before creating any of it, so a single typo
     // can't leave half a batch queued and half rejected.
     const normalized: string[] = [];
     const invalid: unknown[] = [];
@@ -381,7 +162,6 @@ ingestRouter.post('/bulk', async (c) => {
       if (id) normalized.push(id);
       else invalid.push(raw);
     }
-
     if (invalid.length > 0) {
       return c.json(
         {
@@ -393,19 +173,43 @@ ingestRouter.post('/bulk', async (c) => {
       );
     }
 
-    const queued: { arxivId: string; jobId: string }[] = [];
-    for (const arxivId of [...new Set(normalized)]) {
-      const jobId = newJobId();
-      await createJob(jobId, 'ingest', {
-        metadata: { arxivId, autoProcess, domain: resolvedDomain },
-      });
-      paperQueue.enqueue(jobId, () => processArxivPaper(jobId, arxivId, autoProcess, resolvedDomain));
-      queued.push({ arxivId, jobId });
-    }
+    const unique = [...new Set(normalized)];
+    // Each document may chain a process job, so a batch admits at up to 2× size.
+    const full = await admit(c, unique.length * (autoProcess ? 2 : 1));
+    if (full) return full;
+
+    // Batch + jobs in one transaction: a batch that exists with half its jobs
+    // missing would report completion forever.
+    const { batch, queued } = await db.transaction(async (tx) => {
+      const [batch] = await tx
+        .insert(batches)
+        .values({
+          note: typeof note === 'string' ? note.slice(0, 500) : null,
+          domain: resolvedDomain,
+          total: unique.length,
+        })
+        .returning();
+
+      const queued: { arxivId: string; jobId: string }[] = [];
+      for (const arxivId of unique) {
+        const jobId = newJobId();
+        await tx.insert(jobs).values({
+          id: jobId,
+          type: 'ingest',
+          status: 'queued',
+          batchId: batch.id,
+          metadata: { arxivId, autoProcess, domain: resolvedDomain } as never,
+        });
+        queued.push({ arxivId, jobId });
+      }
+      return { batch, queued };
+    });
 
     return c.json(
       {
         message: `Queued ${queued.length} papers for ingestion`,
+        batchId: batch.id,
+        statusUrl: `/api/ingest/batches/${batch.id}`,
         domain: resolvedDomain,
         jobs: queued,
       },
@@ -413,6 +217,81 @@ ingestRouter.post('/bulk', async (c) => {
     );
   } catch (error) {
     return routeError(c, error, 'Failed to create bulk ingestion');
+  }
+});
+
+/**
+ * Batch progress, computed from the member jobs at read time — never from
+ * counters, which drift. A batch is complete when every job (including chained
+ * process jobs) is terminal.
+ */
+ingestRouter.get('/batches/:id', async (c) => {
+  try {
+    const id = c.req.param('id');
+    if (!isUuid(id)) return c.json({ error: 'Batch not found' }, 404);
+
+    const [batch] = await db.select().from(batches).where(eq(batches.id, id)).limit(1);
+    if (!batch) return c.json({ error: 'Batch not found' }, 404);
+
+    const members = await db
+      .select({
+        id: jobs.id,
+        type: jobs.type,
+        status: jobs.status,
+        attempts: jobs.attempts,
+        paperId: jobs.paperId,
+        error: jobs.error,
+        progress: jobs.progress,
+        metadata: jobs.metadata,
+        updatedAt: jobs.updatedAt,
+      })
+      .from(jobs)
+      .where(eq(jobs.batchId, id))
+      .orderBy(jobs.createdAt);
+
+    const counts: Record<string, number> = {};
+    for (const j of members) counts[j.status] = (counts[j.status] ?? 0) + 1;
+    const terminal = (counts.completed ?? 0) + (counts.failed ?? 0);
+
+    return c.json({
+      batch,
+      complete: members.length > 0 && terminal === members.length,
+      counts,
+      jobs: members.map((j) => ({
+        ...j,
+        arxivId: (j.metadata as { arxivId?: string } | null)?.arxivId,
+        metadata: undefined,
+      })),
+    });
+  } catch (error) {
+    return routeError(c, error, 'Failed to fetch batch');
+  }
+});
+
+ingestRouter.get('/batches', async (c) => {
+  try {
+    const recent = await db.select().from(batches).orderBy(desc(batches.createdAt)).limit(20);
+    if (recent.length === 0) return c.json({ batches: [] });
+
+    const rows = await db
+      .select({ batchId: jobs.batchId, status: jobs.status, count: sql<number>`count(*)::int` })
+      .from(jobs)
+      .where(inArray(jobs.batchId, recent.map((b) => b.id)))
+      .groupBy(jobs.batchId, jobs.status);
+
+    const byBatch = new Map<string, Record<string, number>>();
+    for (const r of rows) {
+      if (!r.batchId) continue;
+      const entry = byBatch.get(r.batchId) ?? {};
+      entry[r.status] = r.count;
+      byBatch.set(r.batchId, entry);
+    }
+
+    return c.json({
+      batches: recent.map((b) => ({ ...b, counts: byBatch.get(b.id) ?? {} })),
+    });
+  } catch (error) {
+    return routeError(c, error, 'Failed to list batches');
   }
 });
 
@@ -459,11 +338,11 @@ ingestRouter.get('/connectors', (c) => {
 /**
  * Ingest from any registered connector.
  *
- * Structured connectors run inline rather than on the background worker: they
- * make no model calls, so the work is parsing and inserts, and a caller who just
- * imported an API surface would rather have the result than a job id to poll.
- * Unstructured sources still go through the queue, because they are minutes of
- * model calls.
+ * Structured connectors run inline: zero model calls, so the work is parsing and
+ * inserts, and a caller who just imported an API surface would rather have the
+ * result than a job id to poll. Unstructured documents with `autoProcess` go to
+ * the process lane instead — they are minutes of GPU work and belong on the
+ * durable queue like any other extraction.
  */
 ingestRouter.post('/connector/:id', async (c) => {
   try {
@@ -475,6 +354,10 @@ ingestRouter.post('/connector/:id', async (c) => {
     const autoProcess = body?.autoProcess !== false;
 
     const documents = await connector.collect(body ?? {}, { domainId: domain });
+
+    const full = await admit(c, connector.structured ? 0 : documents.length);
+    if (full) return full;
+
     const results: Array<Record<string, unknown>> = [];
 
     for (const doc of documents) {
@@ -493,10 +376,10 @@ ingestRouter.post('/connector/:id', async (c) => {
         })
         .returning();
 
-      let stats = null;
-      if (autoProcess) {
+      if (autoProcess && connector.structured) {
         try {
-          stats = await processPaper(row.id);
+          const stats = await processPaper(row.id);
+          results.push({ documentId: row.id, title: doc.title, units: doc.units?.length ?? null, status: 'processed', stats });
         } catch (err) {
           results.push({
             documentId: row.id,
@@ -504,17 +387,18 @@ ingestRouter.post('/connector/:id', async (c) => {
             status: 'failed',
             error: err instanceof Error ? err.message : String(err),
           });
-          continue;
         }
+        continue;
       }
 
-      results.push({
-        documentId: row.id,
-        title: doc.title,
-        units: doc.units?.length ?? null,
-        status: autoProcess ? 'processed' : 'stored',
-        stats,
-      });
+      if (autoProcess) {
+        const jobId = newJobId();
+        await createJob(jobId, 'process', { paperId: row.id });
+        results.push({ documentId: row.id, title: doc.title, status: 'queued', jobId });
+        continue;
+      }
+
+      results.push({ documentId: row.id, title: doc.title, units: doc.units?.length ?? null, status: 'stored' });
     }
 
     return c.json(

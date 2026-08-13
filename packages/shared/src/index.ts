@@ -83,4 +83,9 @@ export interface GraphStats {
 export interface Subgraph {
   nodes: Node[];
   edges: Edge[];
+  /** The node the neighbourhood was expanded from. */
+  center?: Node;
+  depth?: number;
+  /** Domain the traversal was pinned to (never crosses it). */
+  domain?: string;
 }

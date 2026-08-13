@@ -54,9 +54,14 @@ export const api = {
       );
     },
     node: (id: string) =>
-      fetchAPI<{ node: Node; outgoingEdges: Edge[]; incomingEdges: Edge[] }>(
-        `/api/graph/nodes/${id}`
-      ),
+      fetchAPI<{
+        node: Node;
+        domain?: string;
+        /** Evidence sentences from the corpus that mention this node. */
+        mentions?: Array<{ text: string; section: string | null }>;
+        outgoingEdges: Array<Edge & { targetNode?: Node }>;
+        incomingEdges: Array<Edge & { sourceNode?: Node }>;
+      }>(`/api/graph/nodes/${id}`),
     edges: (params?: { type?: string; limit?: number; offset?: number; domain?: string }) => {
       const queryParams = new URLSearchParams();
       if (params?.type) queryParams.set('type', params.type);

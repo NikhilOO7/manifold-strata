@@ -119,3 +119,114 @@ export function computeForceLayout(
   nodes.forEach((node, i) => positions.set(node.id, pos[i]));
   return positions;
 }
+
+// ---------------------------------------------------------------------------
+// Ego (focus + context) layout
+// ---------------------------------------------------------------------------
+
+export interface EgoEdge {
+  source: string;
+  target: string;
+  type: string;
+}
+
+/**
+ * Radial layout around one focus node.
+ *
+ * The force-directed overview was rejected twice, and rightly: it optimises for
+ * seeing the whole graph at once, when the actual task is "start from an entity
+ * and follow its relationships". This layout serves that task directly:
+ *
+ *   - the focus node sits at the centre
+ *   - entities it points AT fan out on the right; entities pointing at IT fan
+ *     out on the left — so direction is carried by position, not deciphered
+ *     from arrowheads
+ *   - within each half, neighbours are grouped by relationship type, so
+ *     "everything it `exposes`" reads as one contiguous arc
+ *   - second-hop nodes sit on an outer ring near their first-hop parent
+ *
+ * The ring radius grows with neighbour count, so labels get the arc length they
+ * need instead of being forced to overlap. Determinstic: same data, same
+ * picture.
+ */
+export function computeEgoLayout(
+  centerId: string,
+  edges: EgoEdge[],
+  opts: { cx?: number; cy?: number } = {}
+): Map<string, Point> {
+  const cx = opts.cx ?? 600;
+  const cy = opts.cy ?? 420;
+  const positions = new Map<string, Point>();
+  positions.set(centerId, { x: cx, y: cy });
+
+  // Direct neighbours, split by direction. A node related in both directions
+  // counts as outgoing (its arc position matters less than having exactly one).
+  const outgoing = new Map<string, string>(); // neighbourId -> relationship type
+  const incoming = new Map<string, string>();
+  for (const e of edges) {
+    if (e.source === centerId && e.target !== centerId) {
+      if (!incoming.has(e.target)) outgoing.set(e.target, e.type);
+    } else if (e.target === centerId && e.source !== centerId) {
+      if (!outgoing.has(e.source)) incoming.set(e.source, e.type);
+    }
+  }
+
+  /** Order a half's members grouped by type, then place along its arc. */
+  const placeHalf = (
+    members: Map<string, string>,
+    arcStartDeg: number,
+    arcEndDeg: number
+  ): void => {
+    const grouped = [...members.entries()].sort(
+      (a, b) => a[1].localeCompare(b[1]) || a[0].localeCompare(b[0])
+    );
+    const n = grouped.length;
+    if (n === 0) return;
+
+    // Radius from required arc length: ~64px of arc per node keeps labels clear.
+    const arcRad = ((arcEndDeg - arcStartDeg) * Math.PI) / 180;
+    const r = Math.max(280, (n * 64) / arcRad);
+
+    grouped.forEach(([id], i) => {
+      // n === 1 sits mid-arc; otherwise spread inclusive of both ends.
+      const t = n === 1 ? 0.5 : i / (n - 1);
+      const deg = arcStartDeg + t * (arcEndDeg - arcStartDeg);
+      const rad = (deg * Math.PI) / 180;
+      positions.set(id, { x: cx + Math.cos(rad) * r, y: cy + Math.sin(rad) * r });
+    });
+  };
+
+  placeHalf(outgoing, -70, 70); // right half
+  placeHalf(incoming, 110, 250); // left half
+
+  // Second hop: nodes reached through a placed first-hop node. Placed on a
+  // short spur outward from their parent, spread slightly so siblings separate.
+  const ringOne = new Set(positions.keys());
+  const childrenOf = new Map<string, string[]>();
+  for (const e of edges) {
+    const parentFirst =
+      ringOne.has(e.source) && e.source !== centerId && !ringOne.has(e.target);
+    const parentSecond =
+      ringOne.has(e.target) && e.target !== centerId && !ringOne.has(e.source);
+    if (parentFirst) {
+      (childrenOf.get(e.source) ?? childrenOf.set(e.source, []).get(e.source)!).push(e.target);
+    } else if (parentSecond) {
+      (childrenOf.get(e.target) ?? childrenOf.set(e.target, []).get(e.target)!).push(e.source);
+    }
+  }
+
+  for (const [parentId, kids] of childrenOf) {
+    const p = positions.get(parentId)!;
+    const baseAngle = Math.atan2(p.y - cy, p.x - cx);
+    const unique = [...new Set(kids)].filter((k) => !positions.has(k));
+    unique.forEach((kid, i) => {
+      // Fan ±0.35 rad around the parent's outward direction.
+      const spread = unique.length === 1 ? 0 : (i / (unique.length - 1) - 0.5) * 0.7;
+      const angle = baseAngle + spread;
+      const r = Math.hypot(p.x - cx, p.y - cy) + 190;
+      positions.set(kid, { x: cx + Math.cos(angle) * r, y: cy + Math.sin(angle) * r });
+    });
+  }
+
+  return positions;
+}

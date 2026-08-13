@@ -1,22 +1,45 @@
 import { hostname } from 'node:os';
 import { db } from '../db';
 import { jobs, papers } from '../db/schema';
-import { and, eq, inArray, isNull, lt, or, sql } from 'drizzle-orm';
+import { and, eq, inArray, lt, sql } from 'drizzle-orm';
 
 /**
- * In-process background worker.
+ * Durable, claimable job queue on Postgres.
  *
- * Paper ingestion/processing is long-running (minutes of LLM calls) and must not
- * block the HTTP request that triggers it, nor run unbounded in parallel and
- * starve the event loop / hammer the local LLM. This is a small bounded-concurrency
- * queue: enqueue() returns immediately, tasks drain `JOB_CONCURRENCY` at a time.
+ * The previous design held queued work as closures in the worker's memory, with
+ * the `jobs` table as a status mirror. That shape has a hard ceiling: a batch of
+ * 100 documents is 20+ hours of GPU time on this hardware, and any restart in
+ * that window — a deploy, a crash, `tsx watch` reloading on a file save — lost
+ * every job not yet started and failed the ones mid-flight. The queue IS the
+ * table now:
  *
- * Job *status* is persisted to the `jobs` table so it survives restarts and is
- * readable from any request handler. Because the queue itself is in-memory, a
- * job belongs to the instance that accepted it: no other process can run it, and
- * no other process may declare it dead while its owner is alive. Ownership plus a
- * renewed lease is what encodes that. For a shared queue (BullMQ + Redis) the
- * route code stays identical and this file becomes the adapter.
+ *   enqueue      insert a row (status 'queued', no owner). Durable immediately.
+ *   claim        `FOR UPDATE SKIP LOCKED` — atomically take the oldest unowned
+ *                job in a lane. Any instance can claim any job, which makes
+ *                multi-instance scale-out real rather than aspirational, with no
+ *                broker to operate. (BullMQ/Redis was considered and rejected:
+ *                it adds an infrastructure dependency to move hundreds of jobs a
+ *                day through a system that already has Postgres. SKIP LOCKED is
+ *                the boring, battle-standard answer at this volume; the enqueue/
+ *                claim contract is small enough that a broker swap stays local
+ *                to this file if volume ever demands it.)
+ *   lease        renewed by heartbeat while running. An instance that dies stops
+ *                renewing; the reaper re-queues its jobs for anyone to claim.
+ *   retry        claiming increments `attempts`. Interrupted or transiently
+ *                failed work is re-queued until MAX_JOB_ATTEMPTS, then failed —
+ *                a restart now means "the batch continues", not "the batch died".
+ *
+ * Two lanes, because the pipeline's stages consume different resources:
+ *
+ *   ingest   network + CPU: arXiv metadata, PDF download (throttled per-host),
+ *            parse (worker thread). Cheap, parallelisable.
+ *   process  GPU: extraction at ~34s/chunk, measured to serialise inside Ollama
+ *            anyway — so its default concurrency is 1 and raising it on one GPU
+ *            buys queueing, not speed.
+ *
+ * Separate lanes mean document N+1 fetches while document N extracts, and a
+ * whole batch is fetched/parsed (restart-safe on disk) within minutes even
+ * though extraction grinds for hours.
  */
 
 export type JobStatus =
@@ -28,6 +51,8 @@ export type JobStatus =
   | 'completed'
   | 'failed';
 
+export type JobType = 'ingest' | 'process';
+
 const NON_TERMINAL: JobStatus[] = [
   'queued',
   'fetching_metadata',
@@ -36,120 +61,74 @@ const NON_TERMINAL: JobStatus[] = [
   'processing',
 ];
 
-/**
- * Stable identity for this API instance.
- *
- * Must be stable across restarts of the same logical instance (so it reclaims
- * its own interrupted jobs) and distinct between concurrent instances (so it
- * cannot claim theirs). host:port satisfies both: a restarted dev server keeps
- * its port, two concurrent instances cannot share one. Override with INSTANCE_ID
- * when several instances share a port behind different hostnames.
- */
 export const INSTANCE_ID =
   process.env.INSTANCE_ID || `${hostname()}:${process.env.PORT || '3000'}`;
 
-/** How long a lease stays valid without renewal. */
+export const MAX_JOB_ATTEMPTS = Math.max(
+  1,
+  parseInt(process.env.MAX_JOB_ATTEMPTS || '3', 10) || 3
+);
+
 const LEASE_TTL_MS = Math.max(
   30_000,
   parseInt(process.env.JOB_LEASE_TTL_MS || '120000', 10) || 120_000
 );
-
-/** How often a running job renews its lease. Comfortably inside the TTL. */
 const HEARTBEAT_MS = Math.max(5_000, Math.floor(LEASE_TTL_MS / 4));
+const POLL_MS = Math.max(250, parseInt(process.env.JOB_POLL_MS || '1000', 10) || 1_000);
+const REAPER_MS = 60_000;
+
+/**
+ * How long a shutdown waits for in-flight jobs. Short on purpose — see
+ * `stopWorkers`. Supervisors typically allow ~30s before SIGKILL.
+ */
+const SHUTDOWN_GRACE_MS = Math.max(
+  0,
+  parseInt(process.env.SHUTDOWN_GRACE_MS || '10000', 10) || 10_000
+);
 
 function leaseDeadline(): Date {
   return new Date(Date.now() + LEASE_TTL_MS);
 }
 
-type Task = () => Promise<void>;
-
-class JobQueue {
-  private active = 0;
-  private readonly pending: Array<{ jobId: string; task: Task }> = [];
-  /** Jobs currently executing in this process, kept alive by the heartbeat. */
-  private readonly running = new Set<string>();
-  private heartbeat: NodeJS.Timeout | null = null;
-
-  constructor(private readonly concurrency: number) {}
-
-  enqueue(jobId: string, task: Task): void {
-    this.pending.push({ jobId, task });
-    this.drain();
-  }
-
-  private drain(): void {
-    while (this.active < this.concurrency && this.pending.length > 0) {
-      const { jobId, task } = this.pending.shift()!;
-      this.active += 1;
-      this.running.add(jobId);
-      this.ensureHeartbeat();
-
-      task()
-        .catch((err) => console.error(`[queue] job ${jobId} failed:`, err))
-        .finally(() => {
-          this.active -= 1;
-          this.running.delete(jobId);
-          this.stopHeartbeatIfIdle();
-          this.drain();
-        });
-    }
-  }
-
-  private ensureHeartbeat(): void {
-    if (this.heartbeat) return;
-    this.heartbeat = setInterval(() => {
-      void this.renewLeases();
-    }, HEARTBEAT_MS);
-    // Never hold the process open just to renew leases.
-    this.heartbeat.unref?.();
-  }
-
-  private stopHeartbeatIfIdle(): void {
-    if (this.running.size > 0 || !this.heartbeat) return;
-    clearInterval(this.heartbeat);
-    this.heartbeat = null;
-  }
-
-  private async renewLeases(): Promise<void> {
-    const ids = [...this.running];
-    if (ids.length === 0) return;
-    try {
-      await db
-        .update(jobs)
-        .set({ leaseExpiresAt: leaseDeadline() })
-        .where(inArray(jobs.id, ids));
-    } catch (err) {
-      // A transient DB blip must not kill the worker; the lease TTL is generous
-      // enough to survive a missed beat or two.
-      console.warn('[queue] lease renewal failed:', err instanceof Error ? err.message : err);
-    }
-  }
-
-  /** Queued-but-not-started jobs, lost if this process exits. */
-  pendingJobIds(): string[] {
-    return this.pending.map((p) => p.jobId);
+/**
+ * Thrown by a handler when retrying cannot change the outcome — an arXiv id
+ * that does not exist, a document with no text, an unregistered domain. The
+ * runner fails the job immediately instead of burning the remaining attempts
+ * (which for the process lane would mean re-running fifteen minutes of GPU
+ * work to reach the same dead end).
+ */
+export class PermanentJobError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'PermanentJobError';
   }
 }
 
-export const paperQueue = new JobQueue(
-  Math.max(1, parseInt(process.env.JOB_CONCURRENCY || '2', 10) || 2)
-);
+export type Job = typeof jobs.$inferSelect;
+export type JobHandler = (job: Job) => Promise<void>;
 
-// --- Durable job-status helpers ---------------------------------------------
+const handlers = new Map<JobType, JobHandler>();
+
+export function registerHandler(type: JobType, handler: JobHandler): void {
+  handlers.set(type, handler);
+}
+
+// --- Durable job rows --------------------------------------------------------
 
 export async function createJob(
   id: string,
-  type: 'ingest' | 'process',
-  fields: { status?: JobStatus; paperId?: string; metadata?: unknown } = {}
+  type: JobType,
+  fields: { status?: JobStatus; paperId?: string; metadata?: unknown; batchId?: string } = {}
 ): Promise<void> {
+  // No owner and no lease at creation: a queued row belongs to nobody until an
+  // instance claims it. That single change is what makes the backlog durable.
   await db.insert(jobs).values({
     id,
     type,
     status: fields.status ?? 'queued',
     paperId: fields.paperId ?? null,
-    metadata: (fields.metadata as any) ?? null,
-    owner: INSTANCE_ID,
-    leaseExpiresAt: leaseDeadline(),
+    metadata: (fields.metadata as never) ?? null,
+    batchId: fields.batchId ?? null,
   });
 }
 
@@ -163,73 +142,279 @@ export async function setJobStatus(
     .set({
       ...fields,
       updatedAt: new Date(),
-      // Progress is itself proof of life; release the lease once terminal.
       leaseExpiresAt: terminal ? null : leaseDeadline(),
     })
     .where(eq(jobs.id, id));
 }
 
-export async function getJob(id: string) {
+export async function getJob(id: string): Promise<Job | null> {
   const [job] = await db.select().from(jobs).where(eq(jobs.id, id)).limit(1);
   return job ?? null;
 }
 
-export interface RecoveryResult {
-  ownJobs: number;
-  expiredLeases: number;
-  papers: number;
+// --- Claiming ----------------------------------------------------------------
+
+/**
+ * Atomically claim the oldest unowned queued job in a lane.
+ *
+ * `FOR UPDATE SKIP LOCKED` is what makes N concurrent claimers safe: each
+ * SELECT locks a different candidate row or skips past locked ones, so two
+ * instances can never take the same job and neither ever waits on the other.
+ */
+export async function claimNextJob(type: JobType): Promise<Job | null> {
+  const rows = (await db.execute(sql`
+    update jobs
+    set owner = ${INSTANCE_ID},
+        lease_expires_at = ${leaseDeadline().toISOString()}::timestamptz,
+        attempts = attempts + 1,
+        updated_at = now()
+    where id = (
+      select id from jobs
+      where status = 'queued' and owner is null and type = ${type}
+      order by created_at
+      limit 1
+      for update skip locked
+    )
+    returning id
+  `)) as unknown as Array<{ id: string }>;
+
+  if (rows.length === 0) return null;
+  return getJob(rows[0].id);
+}
+
+/** Return a job to the queue for another attempt (or a later instance). */
+async function requeueJob(id: string, reason: string): Promise<void> {
+  await db
+    .update(jobs)
+    .set({
+      status: 'queued',
+      owner: null,
+      leaseExpiresAt: null,
+      error: `${reason} — will retry`,
+      updatedAt: new Date(),
+    })
+    .where(eq(jobs.id, id));
+}
+
+// --- Worker loops ------------------------------------------------------------
+
+interface Lane {
+  type: JobType;
+  limit: number;
+  active: number;
+}
+
+let running = false;
+const runningJobIds = new Set<string>();
+const timers: NodeJS.Timeout[] = [];
+
+async function runClaimed(job: Job, lane: Lane): Promise<void> {
+  const handler = handlers.get(job.type as JobType);
+  if (!handler) {
+    // A row we cannot run must not be swallowed into limbo — release it for an
+    // instance that does have the handler (rolling deploys), leaseless so the
+    // reaper picks it up if nobody ever does.
+    await requeueJob(job.id, `no handler registered for "${job.type}" on ${INSTANCE_ID}`);
+    return;
+  }
+
+  runningJobIds.add(job.id);
+  try {
+    await handler(job);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const permanent = err instanceof PermanentJobError;
+    if (permanent || job.attempts >= MAX_JOB_ATTEMPTS) {
+      await setJobStatus(job.id, {
+        status: 'failed',
+        error: permanent ? message : `${message} (after ${job.attempts} attempt(s))`,
+      }).catch(() => {});
+    } else {
+      console.warn(`[queue] ${job.type} ${job.id} attempt ${job.attempts} failed: ${message}`);
+      await requeueJob(job.id, message).catch(() => {});
+    }
+  } finally {
+    runningJobIds.delete(job.id);
+    lane.active -= 1;
+  }
+}
+
+function startLane(lane: Lane): void {
+  const tick = async () => {
+    if (!running) return;
+    try {
+      // Drain up to the lane's limit; stop on empty so idle costs one query per poll.
+      while (lane.active < lane.limit) {
+        const job = await claimNextJob(lane.type);
+        if (!job) break;
+        lane.active += 1;
+        void runClaimed(job, lane);
+      }
+    } catch (err) {
+      console.warn(`[queue] ${lane.type} lane poll failed:`, err instanceof Error ? err.message : err);
+    }
+  };
+
+  // Jitter so multiple instances do not synchronise their polls.
+  const interval = setInterval(tick, POLL_MS + Math.floor(Math.random() * 250));
+  interval.unref?.();
+  timers.push(interval);
+  void tick();
+}
+
+function startHeartbeat(): void {
+  const interval = setInterval(() => {
+    const ids = [...runningJobIds];
+    if (ids.length === 0) return;
+    void db
+      .update(jobs)
+      .set({ leaseExpiresAt: leaseDeadline() })
+      .where(inArray(jobs.id, ids))
+      .catch((err) => console.warn('[queue] lease renewal failed:', err?.message ?? err));
+  }, HEARTBEAT_MS);
+  interval.unref?.();
+  timers.push(interval);
+}
+
+export interface WorkerConfig {
+  ingestConcurrency?: number;
+  processConcurrency?: number;
+}
+
+export function startWorkers(config: WorkerConfig = {}): void {
+  if (running) return;
+  running = true;
+
+  const ingestLimit =
+    config.ingestConcurrency ??
+    Math.max(1, parseInt(process.env.FETCH_CONCURRENCY || '2', 10) || 2);
+  // Default 1: extraction serialises inside a single Ollama GPU anyway (measured),
+  // so extra concurrency here buys memory pressure, not throughput. On a hosted
+  // extraction provider, raise it — the bottleneck moves to the network.
+  const processLimit =
+    config.processConcurrency ??
+    Math.max(1, parseInt(process.env.PROCESS_CONCURRENCY || process.env.JOB_CONCURRENCY || '1', 10) || 1);
+
+  startLane({ type: 'ingest', limit: ingestLimit, active: 0 });
+  startLane({ type: 'process', limit: processLimit, active: 0 });
+  startHeartbeat();
+
+  const reaper = setInterval(() => void reapExpiredJobs(), REAPER_MS);
+  reaper.unref?.();
+  timers.push(reaper);
+
+  console.log(
+    `✓ Workers: ingest×${ingestLimit} (network/CPU) · process×${processLimit} (GPU) · ` +
+      `retry up to ${MAX_JOB_ATTEMPTS} attempts · lease ${Math.round(LEASE_TTL_MS / 1000)}s`
+  );
+}
+
+export interface DrainResult {
+  /** In-flight jobs that finished within the grace period. */
+  drained: number;
+  /** Jobs still running when we stopped waiting; recovered via lease expiry. */
+  inFlight: number;
 }
 
 /**
- * Called once on startup.
+ * Stop claiming and let in-flight work finish, within a bounded grace period.
  *
- * Recovers exactly two categories, and nothing else:
+ * What this deliberately does NOT do is release still-running claims back to the
+ * queue. That would look like a faster handover and would be a correctness bug:
+ * the job is still executing in this process, so another instance could claim it
+ * and both would extract the same paper into the same graph concurrently. The
+ * lease exists precisely to make that impossible, so an interrupted job is left
+ * leased and recovered the safe way — by expiry, bounded by JOB_LEASE_TTL_MS, or
+ * immediately by this instance's own startup recovery if it comes back first.
  *
- *  1. Jobs owned by *this* instance. We have just started, so our in-memory
- *     queue is empty by definition — anything we own that is still running was
- *     interrupted by the previous process exiting.
- *  2. Jobs whose lease has expired. Their owner stopped renewing, so it is gone
- *     for good and nobody else will ever run them.
- *
- * It used to fail every non-terminal job unconditionally. With two processes
- * sharing a database — a second instance, a test run, or a dev server reloading
- * on file change — starting one silently killed the other's in-flight ingestion
- * and reported "Interrupted by server restart" on work that was still running.
- *
- * Papers are recovered alongside jobs: recovering only the job row left the
- * paper on a non-terminal `processingStatus`, so `GET /api/papers/processing`
- * (which the Dashboard polls) listed it as in-flight forever.
+ * The grace period is short by design. Most ingest-lane work finishes in seconds;
+ * extraction takes ~15 minutes and no supervisor waits that long before sending
+ * SIGKILL, so waiting for it would only convert a clean shutdown into a killed
+ * one. Extraction is idempotent and restart-safe, which is what makes leaving it
+ * to the lease an honest answer rather than a resigned one.
  */
-export async function recoverOrphanedJobs(): Promise<RecoveryResult> {
-  return db.transaction(async (tx) => {
-    const claimable = or(
-      eq(jobs.owner, INSTANCE_ID),
-      isNull(jobs.owner), // pre-ownership rows
-      isNull(jobs.leaseExpiresAt),
-      lt(jobs.leaseExpiresAt, new Date())
-    );
+export async function stopWorkers(graceMs = SHUTDOWN_GRACE_MS): Promise<DrainResult> {
+  const before = runningJobIds.size;
+  running = false;
+  for (const t of timers) clearInterval(t);
+  timers.length = 0;
 
-    const recovered = await tx
+  const deadline = Date.now() + Math.max(0, graceMs);
+  while (runningJobIds.size > 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+
+  return { drained: before - runningJobIds.size, inFlight: runningJobIds.size };
+}
+
+/** Job ids this instance is currently executing — for shutdown reporting. */
+export function inFlightJobIds(): string[] {
+  return [...runningJobIds];
+}
+
+// --- Recovery ----------------------------------------------------------------
+
+export interface RecoveryResult {
+  requeued: number;
+  failed: number;
+  papersReset: number;
+}
+
+/**
+ * Re-queue or fail jobs whose owner has stopped renewing its lease.
+ *
+ * `ownerFilter` narrows the sweep to one instance's jobs regardless of lease —
+ * used at startup for our own leftovers, which are dead by definition (we just
+ * started; our in-memory running set is empty).
+ */
+export async function reapExpiredJobs(ownerFilter?: string): Promise<RecoveryResult> {
+  const orphaned = ownerFilter
+    ? and(
+        inArray(jobs.status, NON_TERMINAL),
+        sql`(${jobs.owner} = ${ownerFilter} or (${jobs.owner} is not null and ${jobs.leaseExpiresAt} < now()))`
+      )
+    : and(
+        inArray(jobs.status, NON_TERMINAL),
+        sql`${jobs.owner} is not null`,
+        lt(jobs.leaseExpiresAt, new Date())
+      );
+
+  return db.transaction(async (tx) => {
+    // Interrupted but retriable: back to the queue for any instance.
+    const requeued = await tx
+      .update(jobs)
+      .set({
+        status: 'queued',
+        owner: null,
+        leaseExpiresAt: null,
+        error: 'Interrupted (instance stopped or lease expired) — requeued',
+        updatedAt: new Date(),
+      })
+      .where(and(orphaned, lt(jobs.attempts, MAX_JOB_ATTEMPTS)))
+      .returning({ id: jobs.id });
+
+    // Out of attempts: fail honestly.
+    const failed = await tx
       .update(jobs)
       .set({
         status: 'failed',
-        error: 'Interrupted by server restart. Please retry.',
+        owner: null,
         leaseExpiresAt: null,
+        error: `Interrupted and out of retry attempts (${MAX_JOB_ATTEMPTS})`,
         updatedAt: new Date(),
       })
-      .where(and(inArray(jobs.status, NON_TERMINAL), claimable))
-      .returning({ id: jobs.id, owner: jobs.owner });
+      .where(and(orphaned, sql`${jobs.attempts} >= ${MAX_JOB_ATTEMPTS}`))
+      .returning({ id: jobs.id });
 
-    const ownJobs = recovered.filter((r) => r.owner === INSTANCE_ID).length;
-
-    // Only papers with no live job still working on them. A paper whose job
-    // belongs to another running instance must keep its in-progress status.
-    const recoveredPapers = await tx
+    // Papers stuck mid-processing with NO live or queued job behind them: the
+    // requeue above keeps resumable papers out of this set, because their job is
+    // non-terminal again by the time this runs.
+    const papersReset = await tx
       .update(papers)
       .set({
         processed: false,
         processingStatus: 'failed',
-        processingError: 'Interrupted by server restart. Reprocess to retry.',
+        processingError: 'Processing was interrupted and could not be resumed.',
         updatedAt: new Date(),
       })
       .where(
@@ -251,10 +436,60 @@ export async function recoverOrphanedJobs(): Promise<RecoveryResult> {
       )
       .returning({ id: papers.id });
 
-    return {
-      ownJobs,
-      expiredLeases: recovered.length - ownJobs,
-      papers: recoveredPapers.length,
-    };
+    return { requeued: requeued.length, failed: failed.length, papersReset: papersReset.length };
   });
 }
+
+/**
+ * Startup recovery. Where the old version failed every interrupted job with
+ * "please retry", this one retries them itself — that difference is the whole
+ * point of the durable queue. Queued unowned jobs need no recovery at all:
+ * they are simply still in the queue.
+ */
+export async function recoverOnStartup(): Promise<RecoveryResult> {
+  return reapExpiredJobs(INSTANCE_ID);
+}
+
+// --- Introspection -----------------------------------------------------------
+
+export interface QueueDepth {
+  queued: number;
+  running: number;
+  byType: Record<string, { queued: number; running: number }>;
+}
+
+export async function queueDepth(): Promise<QueueDepth> {
+  const rows = (await db.execute(sql`
+    select type,
+      count(*) filter (where status = 'queued' and owner is null) as queued,
+      count(*) filter (where status in ('queued','fetching_metadata','downloading_pdf','extracting_text','processing') and owner is not null) as running
+    from jobs
+    group by type
+  `)) as unknown as Array<{ type: string; queued: string; running: string }>;
+
+  const byType: QueueDepth['byType'] = {};
+  let queued = 0;
+  let runningCount = 0;
+  for (const r of rows) {
+    const q = Number(r.queued);
+    const run = Number(r.running);
+    byType[r.type] = { queued: q, running: run };
+    queued += q;
+    runningCount += run;
+  }
+  return { queued, running: runningCount, byType };
+}
+
+/** Non-terminal job count — the admission-control gauge. */
+export async function pendingJobCount(): Promise<number> {
+  const [row] = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(jobs)
+    .where(inArray(jobs.status, NON_TERMINAL));
+  return row?.count ?? 0;
+}
+
+export const MAX_PENDING_JOBS = Math.max(
+  1,
+  parseInt(process.env.MAX_PENDING_JOBS || '500', 10) || 500
+);

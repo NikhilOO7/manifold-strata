@@ -12,7 +12,7 @@ The result: ingestion uses **one** LLM call per chunk (extraction) instead of th
 
 | Concern | Typical RAG / agent stack | Manifold |
 |---|---|---|
-| Entity resolution | 1 LLM call per chunk | 1 batched **embedding** call, cosine + normalized-name match ([resolve-embed.ts](apps/api/src/knowledge-field/resolve-embed.ts)) |
+| Entity resolution | 1 LLM call per chunk | 1 batched **embedding** call, then two indexed lookups — exact name + HNSW k-NN ([resolve-embed.ts](apps/api/src/knowledge-field/resolve-embed.ts), [resolve-candidates.ts](apps/api/src/knowledge-field/resolve-candidates.ts)) |
 | Relationship validation | 1 LLM call per chunk | **type-compatibility matrix** + confidence floor, 0 LLM calls ([validate-rules.ts](apps/api/src/knowledge-field/validate-rules.ts)) |
 | Multi-hop retrieval | repeated retrieve→reason loops | one **Personalized PageRank** pass over the graph ([ppr.ts](apps/api/src/knowledge-field/ppr.ts)) |
 | Hierarchy ("what generalizes X?") | not modeled | **Poincaré-ball** embeddings; norm ≈ generality, distance ≈ relatedness ([hyperbolic.ts](apps/api/src/knowledge-field/hyperbolic.ts)) |
@@ -206,12 +206,17 @@ VITE_API_URL=http://localhost:3000
 | `OPENAI_EMBED_MODEL` | `text-embedding-3-small` | OpenAI embedding model |
 | `AUTH_MODE` | — | `required` enforces scoped credentials on every `/api` route. Unset = auth disabled (dev) |
 | `MCP_DOMAINS` | — | Comma-separated domains the MCP server may read. Unset = all |
-| `JOB_CONCURRENCY` | `2` | Concurrent papers in the background worker |
+| `FETCH_CONCURRENCY` | `2` | Ingest-lane workers (network/CPU: metadata, PDF, parse) |
+| `PROCESS_CONCURRENCY` | `1` | Process-lane workers (GPU extraction; >1 on one GPU buys queueing, not speed) |
+| `MAX_PENDING_JOBS` | `500` | Admission ceiling — bulk requests beyond it get `429` with the current depth |
+| `MAX_JOB_ATTEMPTS` | `3` | Claims per job before an interrupted/failing job is failed for good |
 | `VITE_API_URL` | `http://localhost:3000` | API base URL for the web app |
 | `CORS_ORIGINS` | localhost 5173/5174/3000 | Comma-separated allowed origins |
 | `INSTANCE_ID` | `<hostname>:<port>` | Identity used for job ownership; must differ between concurrent instances |
 | `TRUSTED_PROXY_HOPS` | `0` | Proxies you control in front of the API. `0` ignores `X-Forwarded-For` entirely |
-| `RESOLUTION_CANDIDATE_LIMIT` | `2000` | Existing in-domain nodes entity resolution compares against (logs when hit) |
+| `RESOLUTION_ANN_K` | `8` | Neighbours fetched per mention from the HNSW index during resolution |
+| `RESOLUTION_CANDIDATE_LIMIT` | `2000` | **Legacy pipeline only** — nodes shown to the LLM resolver, bounded by prompt size. The field pipeline reads the index and has no window. |
+| `SHUTDOWN_GRACE_MS` | `10000` | How long SIGTERM waits for in-flight jobs before leaving them to lease recovery |
 | `LLM_UNAVAILABLE_ABORT_AFTER` | `3` | Consecutive unreachable-model chunk failures before abandoning a paper |
 | `MAX_PDF_MB` | `50` | Hard ceiling on a downloaded PDF |
 | `LLM_TIMEOUT_MS` | `120000` | Deadline for one model call |
@@ -270,7 +275,7 @@ Then open the **Graph Explorer** at http://localhost:5173/explorer — filter by
 
 ## Operational features
 
-- **Background worker + durable jobs** — ingestion/processing run on an in-process bounded-concurrency queue ([apps/api/src/queue](apps/api/src/queue/index.ts)); the request returns `202` immediately. Job status is persisted in a `jobs` table (survives restarts). Each job records the instance that owns it and renews a lease while running, so startup recovery fails **its own** interrupted jobs and jobs whose lease has lapsed — never another live instance's in-flight work.
+- **Durable, claimable job queue** — the `jobs` table *is* the queue ([apps/api/src/queue](apps/api/src/queue/index.ts)). Routes insert rows; workers claim them with `FOR UPDATE SKIP LOCKED`, so any instance can drain any lane and a restart *resumes* the backlog instead of orphaning it — proven by killing the process mid-extraction and watching the job re-queue, reclaim, and complete with zero duplicated edges. Two lanes with separate concurrency: `ingest` (network/CPU — metadata, PDF download, parse in a worker thread) and `process` (GPU — extraction, default 1 because a single GPU serialises it anyway). Interrupted or transiently-failed jobs retry up to `MAX_JOB_ATTEMPTS`; handlers mark dead ends with `PermanentJobError` so retries are never burned reaching the same answer. PDF parsing runs in a `worker_threads` worker — measured on-thread, a 2.2 MB PDF blocked the event loop for the full ~400 ms parse (0 timer ticks); in the worker the loop stays live.
 - **Failures are loud** — a chunk that fails is counted as failed, not processed; a paper whose chunks all fail is marked `failed` with the reason in `processingError`, never `completed`; a job whose pipeline threw reports `failed`. If the model is unreachable for `LLM_UNAVAILABLE_ABORT_AFTER` consecutive chunks the paper is abandoned immediately rather than re-discovering the outage on every chunk.
 - **Honest health** — `GET /health` checks the database, the chat provider (including whether the configured Ollama model is actually pulled) and the embedding provider, returning `503` and naming the specific misconfiguration. It does not report `ok` while extraction cannot work.
 - **Bounded external calls** — every outbound request (arXiv, PDF, LLM, embeddings) has a deadline, and PDF downloads are streamed under a size cap, so one hung or oversized response cannot permanently consume a worker slot or exhaust memory.
@@ -321,7 +326,7 @@ A single instance can host several research fields without their graphs bleeding
 
 How isolation works:
 - Papers are tagged with a `domain`; nodes, edges, and propositions are **stamped** with it. Only the canonical registry id is ever persisted, so a paper and its extracted entities can never disagree about which domain they are in.
-- Entity resolution only matches within the same domain, so `attention` (NLP) and `attention` (vision) stay separate nodes — **no cross-contamination**.
+- Entity resolution only matches within the same domain, so `attention` (NLP) and `attention` (vision) stay separate nodes — **no cross-contamination**. The domain predicate lives inside both resolution lookups, so isolation constrains the index search rather than trimming its results.
 - **Unknown domains fail closed.** An unregistered `?domain=` is a `400` naming the valid domains, at every entry point (graph, papers, field, ingest, backfill, MCP). It is never silently treated as the default domain — returning one field's graph to a caller who asked for another's is the exact failure this design exists to prevent.
 - **Traversal never crosses a boundary.** Subgraph, node-detail, and hierarchy views are pinned to the center node's domain, and an edge is only followed when *both* endpoints are in it. A node outside the requested scope returns `404`, not `403`, so these endpoints cannot be used to confirm other domains' entities.
 - Retrieval (`/api/field/query`, MCP tools), graph views, and per-domain hyperbolic/community builds all scope by domain.
@@ -424,6 +429,8 @@ All graph read endpoints accept an optional `?domain=` filter; omit it to span e
 - `POST /api/ingest/arxiv` — ingest one paper from arXiv (optional `domain` in body) *(auth)*
 - `POST /api/ingest/bulk` — ingest up to 100 papers (optional `domain`) *(auth)*
 - `GET /api/ingest/status/:jobId` — durable job status
+- `GET /api/ingest/batches/:id` — batch progress, computed from member jobs (`counts`, `complete`)
+- `GET /api/ingest/batches` — recent batches with per-status counts
 - `GET /api/ingest/seed/:domain` — curated seed arXiv IDs for a domain
 
 ### Admin *(admin scope)*
@@ -555,7 +562,7 @@ SQL, not above it.
 - **Auth is a data boundary, not an authorization boundary** — domains isolate *data*, but a single shared `API_KEY` grants access to all of them, and read routes are unauthenticated. Per-domain permissions need per-user keys/JWT (see below).
 - **Status updates are polled** — the Dashboard/Ingestion pages poll every ~2s. Server-Sent Events would push updates and cut idle DB load.
 - **Retrieval is fast but not yet proven at millions of entities** — pgvector + HNSW with a bounded working set measures 153 ms p50 / 193 ms p95 on a 100,000-entity corpus (down from 21 s). Latency still grows with corpus size through buffer-cache pressure; `halfvec`, a lower `hnsw.ef_search`, and fewer dimensions are the next levers. Reproduce with `pnpm --filter api seed:load` and `bench:retrieval`.
-- **Entity resolution has not moved to the index yet** — it still compares in JS against the `RESOLUTION_CANDIDATE_LIMIT` (2000) most recent in-domain nodes, and logs when it hits the cap.
+- **Resolution quality is unmeasured** — it now reads the whole domain through the index, so *which* candidates it sees is no longer a question. What is still unproven is the threshold: 0.82 cosine and the same-type rule were chosen by inspection, not by a harness like the one that governs retrieval. A false merge (two entities becoming one) is harder to notice after the fact than a false split, so this is the next thing worth measuring.
 - **Domains are strictly isolated, with no cross-domain bridges** — each node lives in exactly one domain (see [Domains](#domains-multi-field-isolation)), so a concept studied in two fields becomes two nodes. A future "shared" namespace or a `domains text[]` tag could link them where it's genuinely the same entity. Domains are also config-as-code; a DB-editable registry + per-domain type-compatibility rules are natural extensions.
 - **Hyperbolic/community layers are batch** — `train-hyperbolic` and `communities/build` are run on demand, not incrementally maintained as papers arrive.
 - **Auth is a single shared key** — fine for a protected deployment; real multi-tenant use wants per-user keys / JWT and scoped permissions, with domain membership enforced per principal rather than only per query.

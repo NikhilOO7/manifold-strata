@@ -2,8 +2,7 @@ import { Hono } from 'hono';
 import { db } from '../db';
 import { papers } from '../db/schema';
 import { eq, desc, inArray, sql } from 'drizzle-orm';
-import { processPaper, reprocessPaper } from '../pipeline/processor';
-import { paperQueue, createJob, setJobStatus } from '../queue';
+import { createJob } from '../queue';
 import { domainWhere } from '../domains/filter';
 import { requireDomain, requireScopeOn } from '../middleware/auth';
 import { routeError, isUuid } from './errors';
@@ -143,15 +142,7 @@ papersRouter.post('/:id/process', async (c) => {
       );
     }
 
-    // A paper that already contributed to the graph is *re*processed: its previous
-    // edges/sources/propositions are cleared first. Running the plain path twice
-    // duplicated every one of them, which silently doubled the paper's weight in
-    // PPR and repeated its evidence in every retrieval.
     const alreadyContributed = paper.processed || paper.processingStatus === 'completed';
-
-    console.log(
-      `${alreadyContributed ? 'Reprocessing' : 'Starting processing for'} paper: ${paper.title}`
-    );
 
     await db
       .update(papers)
@@ -163,34 +154,15 @@ papersRouter.post('/:id/process', async (c) => {
       })
       .where(eq(papers.id, id));
 
+    // A durable row in the process lane; the handler always clears the paper's
+    // previous contribution before extracting, so first-run and re-run are the
+    // same idempotent operation and a mid-run restart resumes cleanly.
     const jobId = `job-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    await createJob(jobId, 'process', { status: 'queued', paperId: id });
-
-    paperQueue.enqueue(jobId, async () => {
-      try {
-        await setJobStatus(jobId, { status: 'processing', paperId: id });
-        const stats = alreadyContributed ? await reprocessPaper(id) : await processPaper(id);
-        await setJobStatus(jobId, {
-          status: 'completed',
-          paperId: id,
-          progress:
-            `Processed ${stats.chunksProcessed} chunk(s): ` +
-            `${stats.entitiesCreated} entities, ${stats.relationshipsCreated} relationships` +
-            (stats.chunksFailed > 0 ? `, ${stats.chunksFailed} chunk(s) failed` : ''),
-        });
-      } catch (err) {
-        console.error('Error in processing pipeline:', err);
-        await setJobStatus(jobId, {
-          status: 'failed',
-          paperId: id,
-          error: err instanceof Error ? err.message : 'Unknown error',
-        });
-      }
-    });
+    await createJob(jobId, 'process', { paperId: id });
 
     return c.json(
       {
-        message: alreadyContributed ? 'Reprocessing started' : 'Processing started',
+        message: alreadyContributed ? 'Reprocessing queued' : 'Processing queued',
         paperId: id,
         jobId,
         status: 'queued',

@@ -6,6 +6,7 @@ import {
   TIMEOUTS,
 } from './http';
 import { politeFetch } from './polite-fetch';
+import { parsePdfInWorker, PdfParseError } from './pdf-worker';
 
 export interface PDFContent {
   text: string;
@@ -50,6 +51,29 @@ function cleanExtractedText(text: string): string {
   return cleaned.trim();
 }
 
+/**
+ * Parse in the worker thread; fall back to the on-thread parser only for worker
+ * *infrastructure* failures (spawn/timeout), never for parse failures — a
+ * document the worker could not parse fails identically on the main thread, and
+ * retrying it there just blocks the loop for nothing. The fallback is loud: it
+ * means every request is stalling behind parses again.
+ */
+async function extractViaWorker(buffer: Buffer): Promise<PDFContent> {
+  try {
+    const raw = await parsePdfInWorker(buffer);
+    return { text: cleanExtractedText(raw.text), numPages: raw.numPages, info: raw.info };
+  } catch (err) {
+    if (err instanceof PdfParseError) {
+      throw new Error(`Failed to extract PDF text: ${err.message}`);
+    }
+    console.error(
+      `[pdf] worker unavailable (${err instanceof Error ? err.message : err}) — ` +
+        'parsing on the main thread; the event loop WILL stall for the duration'
+    );
+    return extractTextFromPDF(buffer);
+  }
+}
+
 export async function fetchAndExtractPDF(url: string, retries: number = 3): Promise<PDFContent> {
   let lastError: Error | null = null;
   const sizeCap = maxPdfBytes();
@@ -90,7 +114,7 @@ export async function fetchAndExtractPDF(url: string, retries: number = 3): Prom
 
       console.log(`Downloaded ${(buffer.length / 1024 / 1024).toFixed(2)} MB`);
 
-      return await extractTextFromPDF(buffer);
+      return await extractViaWorker(buffer);
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
 

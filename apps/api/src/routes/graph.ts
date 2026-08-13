@@ -1,6 +1,6 @@
 import { Hono, type Context } from 'hono';
 import { db } from '../db';
-import { nodes, edges, sources, papers } from '../db/schema';
+import { nodes, edges, sources, papers, propositions } from '../db/schema';
 import { eq, sql, ilike, and, or, inArray, type SQL } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/pg-core';
 import { resolveStoredDomain } from '../domains';
@@ -110,9 +110,25 @@ graphRouter.get('/nodes/:id', async (c) => {
       .innerJoin(nodes, eq(edges.sourceId, nodes.id))
       .where(and(eq(edges.targetId, id), edgeScope, peerScope));
 
+    // The corpus's own words about this entity. For extracted nodes the
+    // `description` column is usually empty, so the evidence sentences that
+    // mention the node ARE its context — what it is, and how it is used, in the
+    // language of the papers that talked about it. GIN-indexed containment.
+    const mentions = await db
+      .select({ text: propositions.text, section: propositions.section })
+      .from(propositions)
+      .where(
+        and(
+          domainWhere(propositions.domain, nodeDomain),
+          sql`jsonb_exists(${propositions.nodeIds}, ${id})`
+        )
+      )
+      .limit(6);
+
     return c.json({
       node,
       domain: nodeDomain,
+      mentions,
       outgoingEdges: outgoing.map((o) => ({ ...o.edge, targetNode: o.targetNode })),
       incomingEdges: incoming.map((i) => ({ ...i.edge, sourceNode: i.sourceNode })),
     });

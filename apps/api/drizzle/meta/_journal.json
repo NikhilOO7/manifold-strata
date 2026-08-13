@@ -36,6 +36,13 @@
       "when": 1786497299478,
       "tag": "0004_connector_documents",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1786502851619,
+      "tag": "0005_batches_and_durable_queue",
+      "breakpoints": true
     }
   ]
 }

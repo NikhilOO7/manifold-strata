@@ -3,8 +3,15 @@
  *
  * Instead of asking an LLM to canonicalize/dedup mentions (1 call per chunk),
  * we embed every mention in ONE batch call and match it against existing graph
- * nodes by max(cosine, normalized-name). This collapses "3DGS" / "3D-GS" /
- * "3D Gaussian Splatting" via embedding proximity, with zero LLM calls.
+ * nodes by exact normalized name, then by embedding proximity. This collapses
+ * "3DGS" / "3D-GS" / "3D Gaussian Splatting" onto one node, with zero LLM calls.
+ *
+ * Candidates arrive through a `CandidateSource` rather than as a preloaded
+ * array. That indirection is the correctness fix, not a style choice: the array
+ * form could only ever hold a bounded slice of the graph, so resolution quality
+ * decayed as the corpus grew and entities silently forked past the window. See
+ * `resolve-candidates.ts` for the measurement and the failure mode. It also
+ * keeps this function pure and unit-testable with no database.
  *
  * Output shape is identical to the LLM resolver (ResolverOutput) so the
  * processor's downstream code is unchanged.
@@ -13,6 +20,7 @@
 import { embed, cosine } from '../services/embeddings';
 import type { ExtractorOutput } from '../agents/extractor';
 import type { ResolverOutput, ResolvedEntity, ResolvedRelationship } from '../agents/resolver';
+import type { CandidateSource, ScoredCandidate } from './resolve-candidates';
 
 /** Resolver output plus the mention embeddings, keyed by normalized canonical
  * name, so the processor can persist node_vectors without re-embedding. */
@@ -89,8 +97,7 @@ interface Candidate {
 
 export async function resolveEntitiesEmbed(
   extracted: ExtractorOutput,
-  existingNodes: ExistingNode[],
-  nodeVectors: Map<string, number[]>
+  candidates_: CandidateSource
 ): Promise<EmbedResolverOutput> {
   // 1. Gather all mentions that need a canonical identity: extracted entities
   //    PLUS relationship endpoints (so every edge endpoint exists in the map).
@@ -119,46 +126,70 @@ export async function resolveEntitiesEmbed(
   // 2. One batch embed call for every mention.
   const vectors = await embed(candidates.map((c) => c.mention), 'resolve-embed');
   const vectorsByName = new Map<string, number[]>();
+  candidates.forEach((cand, i) => vectorsByName.set(norm(cand.mention), vectors[i]));
 
-  // 3. Precompute existing-node lookup structures.
-  const byNormName = new Map<string, ExistingNode>();
-  for (const n of existingNodes) {
-    if (n.normalizedName) byNormName.set(n.normalizedName, n);
-    byNormName.set(norm(n.name), n);
-  }
+  // 3. Two indexed lookups for the whole batch, over the WHOLE domain: exact
+  //    normalized name, then approximate nearest neighbours. Both are bounded by
+  //    the number of mentions, not by the size of the graph.
+  const byNormName = await candidates_.byName(candidates.map((c) => norm(c.mention)));
+
+  // Only mentions with no exact match need the vector search; skipping the rest
+  // keeps the k-NN batch as small as the work actually requires.
+  const annIndex: number[] = [];
+  const annQueries: Array<{ vector: number[]; type: string }> = [];
+  candidates.forEach((cand, i) => {
+    if (byNormName.has(norm(cand.mention))) return;
+    annIndex.push(i);
+    annQueries.push({ vector: vectors[i], type: cand.type });
+  });
+
+  const annResults = await candidates_.byVector(annQueries);
+  const nearestByCandidate = new Map<number, ExistingNode | undefined>();
+  annIndex.forEach((candIdx, queryIdx) => {
+    const ranked = annResults[queryIdx] ?? [];
+    // Re-apply the threshold and the type rule here as well as in SQL. The
+    // storage layer constrains the search; this is the rule the resolver is
+    // actually accountable for, and it must hold whatever the source returns.
+    const eligible = ranked.filter(
+      (c) =>
+        c.score > SIM_THRESHOLD &&
+        (normalizeType(c.type) === candidates[candIdx].type ||
+          normalizeType(c.type) === 'paper' ||
+          candidates[candIdx].type === 'paper')
+    );
+    // Highest score, not first returned. The source promises ordering; the
+    // resolver does not depend on it, so a source that relaxes ordering for
+    // speed cannot quietly change which entity a mention resolves to.
+    let best: ScoredCandidate | undefined;
+    for (const c of eligible) if (!best || c.score > best.score) best = c;
+    nearestByCandidate.set(candIdx, best);
+  });
 
   const resolvedEntities: ResolvedEntity[] = [];
   // Maps normalized mention -> chosen canonical display name (for relationships).
   const canonicalByMention = new Map<string, string>();
 
+  // Mentions that resolve to nothing in the graph are still not necessarily
+  // distinct from each other. A single chunk routinely names one thing twice
+  // ("Helios" and "Helios system") and, because neither exists yet, the graph
+  // lookups above cannot relate them — they would become two nodes for one
+  // entity, in one document. That is the same fragmentation the indexed lookups
+  // fixed between documents, and it has to die on both sides or the class is
+  // only half dead. So new mentions are also compared against each other, in
+  // order, with the same threshold and type rule. First occurrence wins the
+  // canonical name: it is deterministic, and the first mention of a thing is
+  // usually the definitional one. The comparison is O(new²) in a chunk's handful
+  // of mentions, all vectors already in hand from the single batch embed.
+  const freshCanonical: Array<{ name: string; vector: number[]; type: EntityType }> = [];
+
+  const typesCompatible = (a: EntityType, b: EntityType): boolean =>
+    a === b || a === 'paper' || b === 'paper';
+
   candidates.forEach((cand, i) => {
     const key = norm(cand.mention);
-    const vec = vectors[i];
-    vectorsByName.set(key, vec);
 
     // Exact / normalized-name match first (cheap and unambiguous).
-    let matched = byNormName.get(key);
-
-    // Embedding match against same-type existing nodes that have a cached vector.
-    if (!matched) {
-      let best: ExistingNode | undefined;
-      let bestScore = SIM_THRESHOLD;
-      for (const n of existingNodes) {
-        const nodeType = normalizeType(n.type);
-        if (nodeType !== cand.type && cand.type !== 'paper' && nodeType !== 'paper') {
-          // allow cross-type only when one side is a paper; otherwise require same type
-          if (nodeType !== cand.type) continue;
-        }
-        const nv = nodeVectors.get(n.id);
-        if (!nv) continue;
-        const score = cosine(vec, nv);
-        if (score > bestScore) {
-          bestScore = score;
-          best = n;
-        }
-      }
-      matched = best;
-    }
+    const matched = byNormName.get(key) ?? nearestByCandidate.get(i);
 
     if (matched) {
       canonicalByMention.set(key, matched.name);
@@ -171,15 +202,45 @@ export async function resolveEntitiesEmbed(
         confidence: 0.9,
       });
     } else {
-      canonicalByMention.set(key, cand.mention);
-      resolvedEntities.push({
-        mention: cand.mention,
-        canonicalId: null,
-        canonicalName: cand.mention,
-        type: cand.type,
-        isNew: true,
-        confidence: 0.7,
-      });
+      // Nothing in the graph. Before minting an identity, check the identities
+      // this very batch has already minted.
+      const vec = vectors[i];
+      let twin: { name: string; type: EntityType } | undefined;
+      let twinScore = SIM_THRESHOLD;
+      for (const prior of freshCanonical) {
+        if (!typesCompatible(prior.type, cand.type)) continue;
+        const score = cosine(vec, prior.vector);
+        if (score > twinScore) {
+          twinScore = score;
+          twin = prior;
+        }
+      }
+
+      if (twin) {
+        // Same canonical name as its twin. The processor already keys new nodes
+        // by canonical name within a run, so this collapses to one node without
+        // any further coordination.
+        canonicalByMention.set(key, twin.name);
+        resolvedEntities.push({
+          mention: cand.mention,
+          canonicalId: null,
+          canonicalName: twin.name,
+          type: twin.type,
+          isNew: true,
+          confidence: 0.7,
+        });
+      } else {
+        freshCanonical.push({ name: cand.mention, vector: vec, type: cand.type });
+        canonicalByMention.set(key, cand.mention);
+        resolvedEntities.push({
+          mention: cand.mention,
+          canonicalId: null,
+          canonicalName: cand.mention,
+          type: cand.type,
+          isNew: true,
+          confidence: 0.7,
+        });
+      }
     }
   });
 

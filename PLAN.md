@@ -445,6 +445,75 @@ reports the distinct models a configuration implies, their approximate resident 
 `OLLAMA_MAX_LOADED_MODELS` is set. Choosing one model for everything is a legitimate answer; choosing it
 unknowingly is not.
 
+### Phase 4c — Batch ingestion architecture · **shipped**
+
+"Process 100 documents in one request" is bounded by arithmetic before architecture: extraction measures
+~34 s/chunk × ~26 chunks ≈ 15 min/paper on this hardware, so 100 documents ≈ 20+ GPU-hours. No queue design
+makes that faster; what the architecture must buy is a run that *survives* — and now it does.
+
+- **The jobs table is the queue.** Routes insert rows; workers claim via `FOR UPDATE SKIP LOCKED`. Chosen over
+  BullMQ/Redis deliberately: hundreds of jobs/day through a system that already has Postgres does not justify
+  operating a broker, and the claim contract keeps a future swap local to one file. Proven live: kill -9 mid-
+  extraction → restart → job re-queued, reclaimed (attempt 2), completed, **zero duplicated edges** (the
+  process handler clears prior contributions before every run, making retries idempotent by construction).
+- **Stage lanes.** `ingest` (network/CPU) and `process` (GPU) drain independently, so a batch is fully fetched
+  and parsed to disk in minutes while extraction grinds for hours, and document N+1 downloads while N extracts.
+- **PDF parsing off the event loop.** Measured: a 2.2 MB parse blocked the loop 100% for ~400 ms (0 timer
+  ticks). Now in a `worker_threads` worker (data-URL module, zero new dependencies) — 20 ticks during the same
+  parse. At 100 documents that removes ~40 s of accumulated API freeze.
+- **Batches.** `POST /bulk` creates a batch + member rows in one transaction and returns `batchId`; progress is
+  computed from member jobs at read time, never denormalised counters. Chained process jobs inherit the batch,
+  so "complete" means the graph is built, not just the PDFs fetched.
+- **Admission control.** A durable queue never loses work, which also means nothing stops a backlog measured in
+  GPU-days. `MAX_PENDING_JOBS` refuses loudly (429 with current depth) instead of accepting silently.
+- **Retry discipline.** Claims increment `attempts`; transient failures re-queue up to 3; handlers throw
+  `PermanentJobError` for dead ends (arXiv id doesn't exist, no text, unregistered domain) so a 15-minute GPU
+  retry is never spent reaching the same answer.
+
+**Honest limits:** throughput on this machine is still the GPU — the architecture buys survivability,
+observability and multi-instance readiness, not speed. With hosted extraction (`MODEL_EXTRACT=openai:…`),
+`PROCESS_CONCURRENCY` scales out and the same design becomes genuinely parallel. Rate limiting remains
+per-instance.
+
+### Phase 4d — Resolution on the index, and shutdown as a first-class event · **shipped**
+
+Two foundation cracks found by hunting the write path the way Phase 1 hunted the read path.
+
+**Entity resolution was scanning a window.** Every mention was compared in JS against the 2000 most recently
+created nodes in the domain. Past that, identity depended on creation order: an entity introduced by paper #1
+was invisible to paper #40, so the graph grew a *second node meaning the same thing* — silently, while logging
+a warning and continuing. Everything downstream inherits it: PPR splits mass across the forks, retrieval
+returns one of them, "what relates to X" answers for half of X. A knowledge graph that fragments as it grows
+is not a knowledge graph, so this outranked any feature.
+
+- Candidates now come from two bounded, domain-scoped index reads
+  ([resolve-candidates.ts](apps/api/src/knowledge-field/resolve-candidates.ts)): a batched equality probe on
+  `nodes_normalized_name_idx`, and a batched k-NN lateral over `node_vectors_embedding_hnsw` that answers every
+  mention in one round trip. Work is bounded by mentions, not by graph size.
+- Filtered ANN asks for `hnsw.iterative_scan` (pgvector ≥ 0.8), so a domain holding a small slice of the corpus
+  still gets K eligible neighbours. Measured: a 20-node minority in 100k returned 8 of 8 either way — but "it
+  happened to work on this corpus" is not a property.
+- `ilike` → `eq` on the per-entity existence probe. Semantically identical (both sides pre-lowercased); on 100k
+  nodes, measured, it was a Seq Scan discarding all 100,000 rows at plan cost 3039 versus an index scan at 12,
+  and it ran once per newly-seen entity per chunk.
+- The same defect existed *inside* a batch: one chunk naming "Helios" and "Helios system" minted two nodes,
+  because neither existed yet so no lookup could relate them. New mentions are now compared against each other
+  too. Verified live end-to-end: two nodes before, one after (`nomic-embed-text` scores the pair 0.881).
+- Proven by a regression suite that seeds **2500** nodes — more than the old window — and demands the oldest
+  entity still resolve, in-domain only. Any reintroduced window fails it.
+- Retrieval quality unchanged by the harness: overall nDCG 87.7%, multi-hop 63.1%, hub 100% — identical.
+
+**A deploy was indistinguishable from a crash.** Nothing handled SIGTERM. Connections were cut mid-response,
+the Postgres pool dropped without closing, and in-flight jobs went to lease-expiry recovery even when two
+seconds from finishing. Now: stop accepting requests → stop claiming → drain for `SHUTDOWN_GRACE_MS` → close
+the pool. Shutdown deliberately does **not** release still-running claims: the job is still executing in this
+process, so another instance would run the same extraction concurrently. Leases exist to prevent exactly that,
+so in-flight work is left leased and recovered by expiry — bounded, and named in the shutdown log so an
+operator knows what is coming back.
+
+**Honest limits:** resolution's threshold (0.82) and type rule are still chosen by inspection rather than by a
+harness. A false merge is harder to detect than a false split; that measurement is the next item.
+
 ### Phase 5 — Agent intelligence
 
 Tool-ranking endpoint, precondition and dependency edges, contradiction detection, temporal "as of" queries,
