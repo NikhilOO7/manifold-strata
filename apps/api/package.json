@@ -16,6 +16,9 @@
     "db:migrate": "tsx src/db/migrate.ts",
     "seed:load": "tsx src/db/seed-load.ts",
     "bench:retrieval": "tsx src/db/bench-retrieval.ts",
+    "bench:lane-width": "tsx src/services/bench-lane-width.ts",
+    "backfill:mentions": "tsx src/db/backfill-mentions.ts",
+    "repair:domain-drift": "tsx src/db/repair-domain-drift.ts",
     "eval": "tsx src/eval/run.ts",
     "auth:bootstrap": "tsx src/auth/bootstrap.ts",
     "models:compare": "tsx src/services/model-bench.ts"

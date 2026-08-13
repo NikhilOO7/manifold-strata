@@ -25,8 +25,32 @@ export const api = {
       fetchAPI<{ papers: Paper[]; pagination: { limit: number; offset: number } }>(
         `/api/papers?limit=${limit}&offset=${offset}`
       ),
+    pause: (id: string) =>
+      fetchAPI<{ message: string; status: string; stoppedImmediately: boolean }>(
+        `/api/papers/${id}/pause`,
+        { method: 'POST' }
+      ),
+    /** Resume or retry — the same operation, keeping completed chunks. */
+    resume: (id: string, rebuild = false) =>
+      fetchAPI<{ message: string; jobId: string; resumingFromChunk: number }>(
+        `/api/papers/${id}/resume${rebuild ? '?rebuild=true' : ''}`,
+        { method: 'POST' }
+      ),
+    chunks: (id: string) =>
+      fetchAPI<{
+        completed: number;
+        chunks: Array<{ index: number; status: string; entities: number; error: string | null }>;
+      }>(`/api/papers/${id}/chunks`),
     processing: () =>
-      fetchAPI<{ papers: Paper[] }>('/api/papers/processing'),
+      fetchAPI<{
+        papers: Array<
+          Paper & {
+            /** Why this paper is where it is: claimed, waiting its turn, or unscheduled. */
+            queue?: { state: 'running' | 'queued' | 'unscheduled'; position?: number };
+          }
+        >;
+        workers?: { processConcurrency: number; running: number; queued: number };
+      }>('/api/papers/processing'),
     get: (id: string) => fetchAPI<Paper>(`/api/papers/${id}`),
     create: (data: Partial<Paper>) =>
       fetchAPI<Paper>('/api/papers', {
@@ -52,6 +76,60 @@ export const api = {
       return fetchAPI<{ nodes: Node[]; pagination: { limit: number; offset: number } }>(
         `/api/graph/nodes?${queryParams}`
       );
+    },
+    /** Papers as entry points, with how much each one contributes. */
+    papers: (domain?: string) =>
+      fetchAPI<{
+        papers: Array<{
+          id: string;
+          name: string;
+          domain: string | null;
+          concepts: number;
+          relationships: number;
+        }>;
+      }>(`/api/graph/papers${domain ? `?domain=${encodeURIComponent(domain)}` : ''}`),
+
+    /** One node read as an argument: edges grouped by the question they answer. */
+    lens: (id: string) =>
+      fetchAPI<{
+        node: { id: string; name: string; type: string; description: string | null };
+        domain: string;
+        total: number;
+        sections: Array<{
+          role: string;
+          label: string;
+          hint: string;
+          items: Array<{
+            id: string;
+            name: string;
+            type: string;
+            relation: string;
+            direction: 'out' | 'in';
+            evidence: string | null;
+          }>;
+        }>;
+      }>(`/api/graph/lens/${id}`),
+
+    /** What two papers share, and what only one of them has. */
+    compare: (a: string, b: string) =>
+      fetchAPI<{
+        a: { id: string; name: string };
+        b: { id: string; name: string };
+        shared: Array<{ id: string; name: string; type: string }>;
+        onlyA: Array<{ id: string; name: string; type: string }>;
+        onlyB: Array<{ id: string; name: string; type: string }>;
+      }>(`/api/graph/compare?a=${a}&b=${b}`),
+
+    /** Most-connected entities, ranked by the database over the whole domain. */
+    hubs: (params?: { domain?: string; type?: string; limit?: number }) => {
+      const q = new URLSearchParams();
+      if (params?.domain) q.set('domain', params.domain);
+      if (params?.type) q.set('type', params.type);
+      if (params?.limit) q.set('limit', String(params.limit));
+      const qs = q.toString();
+      return fetchAPI<{
+        hubs: Array<{ id: string; name: string; type: string; domain: string | null; degree: number }>;
+      }>(`/api/graph/hubs${qs ? `?${qs}` : ''}`);
     },
     node: (id: string) =>
       fetchAPI<{

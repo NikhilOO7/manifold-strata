@@ -10,8 +10,10 @@
 import { registerHandler } from '../queue';
 import { runArxivIngestJob } from './arxiv-ingest';
 import { runProcessJob } from './process-paper';
+import { runAuditJob } from './audit-graph';
 
 export function registerDefaultHandlers(): void {
   registerHandler('ingest', runArxivIngestJob);
   registerHandler('process', runProcessJob);
+  registerHandler('audit', runAuditJob);
 }

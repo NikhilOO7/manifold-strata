@@ -1,6 +1,7 @@
 import { db } from '../db';
-import { papers, nodes, edges, sources, nodeVectors, propositions } from '../db/schema';
-import { eq, inArray, and, desc, sql } from 'drizzle-orm';
+import { papers, nodes, edges, sources, nodeVectors, propositions, paperChunks } from '../db/schema';
+import { eq, inArray, and, desc, sql, notInArray } from 'drizzle-orm';
+import { createHash } from 'node:crypto';
 import { resolveStoredDomain } from '../domains';
 import { domainWhere } from '../domains/filter';
 import { extractEntitiesAndRelationships } from '../agents/extractor';
@@ -146,7 +147,57 @@ export async function processPaper(paperId: string): Promise<ProcessingStats> {
     const chunkErrors: string[] = [];
     let consecutiveUnavailable = 0;
 
+    // Which chunks are already done, and are they still the same chunks?
+    //
+    // Resume is only sound if chunk N still means the text it meant last run.
+    // Chunking is deterministic given the source, so a content hash settles it:
+    // matching hashes mean the checkpoint describes this exact text, and a
+    // mismatch means the boundaries moved and every checkpoint is stale.
+    const chunkHashes = chunks.map((u) => hashUnit(u));
+    const priorChunks = await db
+      .select()
+      .from(paperChunks)
+      .where(eq(paperChunks.paperId, paperId));
+
+    const doneChunks = new Set<number>();
+    for (const prior of priorChunks) {
+      if (prior.status !== 'completed') continue;
+      if (prior.chunkIndex >= chunks.length) continue;
+      if (prior.contentHash !== chunkHashes[prior.chunkIndex]) continue;
+      doneChunks.add(prior.chunkIndex);
+    }
+
+    const staleCheckpoints = priorChunks.length - doneChunks.size;
+    if (staleCheckpoints > 0 && priorChunks.length > 0) {
+      console.log(
+        `[processor] ${staleCheckpoints} checkpoint(s) no longer match the current text — those chunks will be redone`
+      );
+    }
+    if (doneChunks.size > 0) {
+      console.log(
+        `[processor] resuming: ${doneChunks.size}/${chunks.length} chunk(s) already extracted, skipping them`
+      );
+      stats.chunksProcessed += doneChunks.size;
+    }
+
     for (let i = 0; i < chunks.length; i++) {
+      if (doneChunks.has(i)) continue;
+
+      // Cooperative pause, checked between chunks. Interrupting mid-chunk would
+      // waste the ~34s already spent on it and leave a partial extraction to
+      // clean up; between chunks the checkpoint is exact and resuming is free.
+      if (await isPauseRequested(paperId)) {
+        console.log(`[processor] pause requested — stopping cleanly after ${i} chunk(s)`);
+        await db
+          .update(papers)
+          .set({
+            processingStatus: 'paused',
+            processingProgress: Math.floor((i / chunks.length) * 100),
+          })
+          .where(eq(papers.id, paperId));
+        throw new PausedError(`Paused after ${i}/${chunks.length} chunk(s)`);
+      }
+
       console.log(`\n--- Processing chunk ${i + 1}/${chunks.length} ---`);
 
       // Update progress after each chunk
@@ -245,16 +296,30 @@ export async function processPaper(paperId: string): Promise<ProcessingStats> {
             } else {
               const nodeType = (entity.type as string) === 'paper_reference' ? 'paper' : entity.type;
               
-              const [newNode] = await db
-                .insert(nodes)
-                .values({
-                  type: nodeType as any,
-                  domain: domain.id,
-                  name: entity.canonicalName,
-                  normalizedName: entity.canonicalName.toLowerCase(),
-                  paperId: nodeType === 'paper' ? null : paperId,
-                })
-                .returning();
+              // Atomic create-or-get, not check-then-insert.
+              //
+              // The SELECT above is a fast path, not a guarantee: between it and
+              // this INSERT another worker extracting a different paper can
+              // create the same entity. Demonstrated with two concurrent
+              // transactions — two nodes, same normalized_name, same domain — and
+              // reachable in the shipped configuration, because
+              // PROCESS_CONCURRENCY is a knob and the queue is deliberately
+              // multi-instance. Only the database can serialise this, so the
+              // unique index decides it and the conflict clause reads back the
+              // winner instead of raising.
+              const created = (await db.execute(sql`
+                insert into ${nodes} (type, domain, name, normalized_name, paper_id)
+                values (
+                  ${nodeType}, ${domain.id}, ${entity.canonicalName},
+                  ${entity.canonicalName.toLowerCase()},
+                  ${nodeType === 'paper' ? null : paperId}
+                )
+                on conflict ((coalesce(domain, '')), normalized_name)
+                  where normalized_name is not null
+                  do update set updated_at = now()
+                returning id
+              `)) as unknown as Array<{ id: string }>;
+              const newNode = { id: created[0].id };
 
               entityMap.set(entity.canonicalName.toLowerCase(), newNode.id);
               entity.canonicalId = newNode.id;
@@ -280,6 +345,67 @@ export async function processPaper(paperId: string): Promise<ProcessingStats> {
           } else if (entity.canonicalId) {
             entityMap.set(entity.canonicalName.toLowerCase(), entity.canonicalId);
           }
+        }
+
+        // Every entity this chunk named gets an edge to the paper that named it.
+        //
+        // Without this, 62% of the graph was isolated nodes. The cause is
+        // structural, not a tuning problem: the extractor returns `entities` and
+        // `relationships` as two separate lists, so any entity the model did not
+        // happen to put in a relationship became a node with no edges — present
+        // in the corpus, unreachable in the graph, and useless to a reader.
+        //
+        // A `mentions` edge is not an inference. We know this paper named this
+        // entity; that is the extraction record itself, and it is exactly the
+        // structure both questions need. "What does this paper cover" is the
+        // paper's own edges. "What do two papers share" is a two-hop path
+        // through the entity they both mention — which is only traversable if
+        // the entity is attached to both papers in the first place.
+        const mentionTargets = new Set<string>();
+        for (const entity of resolverOutput.resolvedEntities) {
+          const id = entity.canonicalId ?? entityMap.get(entity.canonicalName.toLowerCase());
+          // Never link the paper to itself; that is a self-edge, not a claim.
+          if (id && id !== paperNode) mentionTargets.add(id);
+        }
+
+        for (const targetId of mentionTargets) {
+          await db.transaction(async (tx) => {
+            // One mention edge per (paper, entity) regardless of how many chunks
+            // name it — the claim is "this paper covers this", asserted once.
+            const [existing] = await tx
+              .select({ id: edges.id })
+              .from(edges)
+              .where(
+                and(
+                  eq(edges.sourceId, paperNode),
+                  eq(edges.targetId, targetId),
+                  eq(edges.type, 'mentions')
+                )
+              )
+              .limit(1);
+
+            const edgeId =
+              existing?.id ??
+              (
+                await tx
+                  .insert(edges)
+                  .values({
+                    sourceId: paperNode,
+                    targetId,
+                    type: 'mentions',
+                    domain: domain.id,
+                    confidence: '1.00',
+                  })
+                  .returning()
+              )[0].id;
+
+            // Provenance, chunk-attributed, so a partial resume undoes it
+            // exactly like any other claim this chunk made.
+            await tx
+              .insert(sources)
+              .values({ edgeId, paperId, section, chunkIndex: i })
+              .onConflictDoNothing();
+          });
         }
 
         // The rule validator needs a name -> type map for every edge endpoint.
@@ -345,6 +471,9 @@ export async function processPaper(paperId: string): Promise<ProcessingStats> {
                 paperId: paperId,
                 section: section,
                 extractedText: relationship.evidence?.slice(0, 1000),
+                // Attribution to the chunk, which is what makes a per-chunk undo
+                // possible and therefore a resume safe.
+                chunkIndex: i,
               });
             });
 
@@ -380,7 +509,34 @@ export async function processPaper(paperId: string): Promise<ProcessingStats> {
         }
 
         stats.chunksProcessed++;
+
+        // Checkpoint AFTER the writes land, so a crash between the two costs a
+        // redo of this chunk rather than silently skipping it next run. Losing
+        // a checkpoint is recoverable; recording one that did not happen is not.
+        await db
+          .insert(paperChunks)
+          .values({
+            paperId,
+            chunkIndex: i,
+            status: 'completed',
+            contentHash: chunkHashes[i],
+            section,
+            entities: extractorOutput.entities.length,
+            relationships: validationOutput.accepted.length,
+          })
+          .onConflictDoUpdate({
+            target: [paperChunks.paperId, paperChunks.chunkIndex],
+            set: {
+              status: 'completed',
+              contentHash: chunkHashes[i],
+              entities: extractorOutput.entities.length,
+              relationships: validationOutput.accepted.length,
+              error: null,
+              completedAt: new Date(),
+            },
+          });
       } catch (chunkError) {
+        if (chunkError instanceof PausedError) throw chunkError;
         // A failed chunk is *not* a processed chunk. Counting it as processed is
         // what made a total model outage look like a paper that simply contained
         // no facts.
@@ -415,6 +571,9 @@ export async function processPaper(paperId: string): Promise<ProcessingStats> {
     // Every chunk failing means we learned nothing about this paper. Recording it
     // as processed would bake a false negative into the graph permanently: later
     // queries would report "no evidence" for a paper that was never actually read.
+    // A resumed run that had nothing left to do still counts the chunks it
+    // inherited, so this check asks the right question: did we learn anything
+    // about this paper across all runs, not just this one.
     if (chunks.length > 0 && stats.chunksProcessed === 0) {
       const summary =
         `All ${chunks.length} chunk(s) failed — no knowledge was extracted. ` +
@@ -506,6 +665,42 @@ async function getOrCreatePaperNode(paper: any, domainId: string): Promise<strin
   return paperNode.id;
 }
 
+/**
+ * Stable identity for a chunk's content.
+ *
+ * Only used to detect that the text behind chunk N changed, so a fast
+ * non-cryptographic digest is the right tool — this is a cache key, not a
+ * security boundary.
+ */
+function hashUnit(unit: IngestUnit): string {
+  const body = unit.extraction ? JSON.stringify(unit.extraction) : (unit.text ?? '');
+  return createHash('sha1').update(`${unit.section ?? ''}\u0000${body}`).digest('hex');
+}
+
+/**
+ * Raised when an operator pauses a paper between chunks.
+ *
+ * It is not a failure, so it must not consume the retry budget or mark the paper
+ * failed — the job handler catches it and leaves the work parked, resumable from
+ * the checkpoint at zero cost.
+ */
+export class PausedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PausedError';
+  }
+}
+
+/** Has an operator asked this paper to stop? Checked between chunks. */
+async function isPauseRequested(paperId: string): Promise<boolean> {
+  const [row] = await db
+    .select({ status: papers.processingStatus })
+    .from(papers)
+    .where(eq(papers.id, paperId))
+    .limit(1);
+  return row?.status === 'paused';
+}
+
 function findEntityId(entityMap: Map<string, string>, name: string): string | null {
   if (!name) return null;
   
@@ -553,6 +748,78 @@ export interface ClearedContributions {
  *    was this paper are removed, so co-asserted facts survive with their other
  *    citations intact.
  */
+/**
+ * Drop only the contribution of chunks NOT in `keep`.
+ *
+ * This is the per-chunk sibling of `clearPaperContributions`, and it is what
+ * makes resume idempotent: the chunks about to be re-run have their previous
+ * claims removed first, exactly as a full re-run does for the whole paper, while
+ * completed chunks keep theirs. Rows written before `sources.chunk_index`
+ * existed have a null index and belong to no chunk we can vouch for, so they are
+ * cleared too — attributing them by guess would be worse than redoing them.
+ */
+export async function clearChunkContributions(
+  paperId: string,
+  keep: number[]
+): Promise<ClearedContributions> {
+  return db.transaction(async (tx) => {
+    const scope = keep.length
+      ? and(
+          eq(sources.paperId, paperId),
+          sql`(${sources.chunkIndex} is null or ${sources.chunkIndex} not in ${keep})`
+        )
+      : eq(sources.paperId, paperId);
+
+    const touchedEdgeIds = [
+      ...new Set((await tx.select({ edgeId: sources.edgeId }).from(sources).where(scope)).map((r) => r.edgeId)),
+    ];
+
+    const deletedSources = await tx.delete(sources).where(scope).returning({ id: sources.id });
+
+    let deletedEdges: { id: string }[] = [];
+    if (touchedEdgeIds.length > 0) {
+      // An edge another paper (or a kept chunk) also asserts must survive: the
+      // claim is still supported, so deleting it would destroy evidence we hold.
+      deletedEdges = await tx
+        .delete(edges)
+        .where(
+          and(
+            inArray(edges.id, touchedEdgeIds),
+            sql`not exists (select 1 from ${sources} s where s.edge_id = ${edges.id})`
+          )
+        )
+        .returning({ id: edges.id });
+    }
+
+    // Propositions carry no chunk attribution, and a resumed run rewrites the
+    // ones it produces, so only those from re-run chunks need clearing. Without
+    // per-chunk attribution the safe move is to drop the paper's propositions
+    // only when nothing is being kept.
+    let deletedProps: { id: string }[] = [];
+    if (keep.length === 0) {
+      deletedProps = await tx
+        .delete(propositions)
+        .where(eq(propositions.paperId, paperId))
+        .returning({ id: propositions.id });
+    }
+
+    // Forget the checkpoints for chunks we just undid.
+    if (keep.length) {
+      await tx
+        .delete(paperChunks)
+        .where(and(eq(paperChunks.paperId, paperId), notInArray(paperChunks.chunkIndex, keep)));
+    } else {
+      await tx.delete(paperChunks).where(eq(paperChunks.paperId, paperId));
+    }
+
+    return {
+      edges: deletedEdges.length,
+      sources: deletedSources.length,
+      propositions: deletedProps.length,
+    };
+  });
+}
+
 export async function clearPaperContributions(paperId: string): Promise<ClearedContributions> {
   return db.transaction(async (tx) => {
     const deletedProps = await tx
@@ -609,6 +876,42 @@ export async function reprocessPaper(paperId: string): Promise<ProcessingStats> 
   await db
     .update(papers)
     .set({ processed: false, processingStatus: 'pending', processingProgress: 0 })
+    .where(eq(papers.id, paperId));
+
+  return processPaper(paperId);
+}
+
+/**
+ * Continue a paper from its checkpoint — the default for a retry or a resume.
+ *
+ * The difference from `reprocessPaper` is the whole point of checkpointing:
+ * that one starts over from chunk 0 and is correct but wasteful, this one keeps
+ * every chunk that already completed against unchanged text and re-runs only
+ * what is left. On a 26-chunk paper that failed at chunk 24, it is the
+ * difference between 15 minutes of GPU and one.
+ *
+ * Idempotency is preserved at the finer grain: the chunks about to run have
+ * their previous claims cleared first, exactly as a full re-run does for the
+ * whole paper. Use `reprocessPaper` when the goal is genuinely to rebuild — a
+ * changed extractor, a new model, a corrected document.
+ */
+export async function resumePaper(paperId: string): Promise<ProcessingStats> {
+  const completed = (
+    await db
+      .select({ chunkIndex: paperChunks.chunkIndex })
+      .from(paperChunks)
+      .where(and(eq(paperChunks.paperId, paperId), eq(paperChunks.status, 'completed')))
+  ).map((r) => r.chunkIndex);
+
+  const cleared = await clearChunkContributions(paperId, completed);
+  console.log(
+    `[processor] resuming paper ${paperId}: keeping ${completed.length} completed chunk(s), ` +
+      `cleared ${cleared.edges} edge(s) and ${cleared.sources} source(s) from unfinished ones`
+  );
+
+  await db
+    .update(papers)
+    .set({ processed: false, processingStatus: 'pending', processingError: null })
     .where(eq(papers.id, paperId));
 
   return processPaper(paperId);

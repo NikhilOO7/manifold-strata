@@ -115,19 +115,32 @@ describe('resolveEntitiesEmbed', () => {
   });
 
   test('the best candidate wins, not the first one returned', async () => {
-    // A source is free to relax ordering for speed; identity must not depend on it.
+    // A source is free to relax ordering for speed; identity must not depend on
+    // it. Both candidates must be ones the merge guard would actually permit,
+    // or this would test the guard rather than the ordering.
     const out = await resolveEntitiesEmbed(
-      extraction([{ mention: '3DGS', type: 'method' }]),
+      extraction([{ mention: 'Helios', type: 'method' }]),
       stubSource({
         byVector: [
           [
-            { ...node('n1', 'Good enough'), score: 0.84 },
-            { ...node('n2', 'Actually right'), score: 0.97 },
+            { ...node('n1', 'Helios framework'), score: 0.84 },
+            { ...node('n2', 'Helios system'), score: 0.97 },
           ],
         ],
       })
     );
     assert.equal(out.resolvedEntities[0].canonicalId, 'n2');
+  });
+
+  test('a merge the guard refuses mints a new entity instead', async () => {
+    // Proximity is not identity. "GNMT + RL" and "GNMT + RL Ensemble" sit at
+    // 0.917 cosine in the real graph and are different things.
+    const out = await resolveEntitiesEmbed(
+      extraction([{ mention: 'GNMT + RL', type: 'model' }]),
+      stubSource({ byVector: [[{ ...node('n1', 'GNMT + RL Ensemble', 'model'), score: 0.917 }]] })
+    );
+    assert.equal(out.resolvedEntities[0].canonicalId, null);
+    assert.equal(out.resolvedEntities[0].isNew, true);
   });
 
   test('a strong match of an incompatible type is refused', async () => {
@@ -138,12 +151,24 @@ describe('resolveEntitiesEmbed', () => {
     assert.equal(out.resolvedEntities[0].isNew, true, 'a dataset must not become a method');
   });
 
-  test('a paper may match across types — the extractor names papers both ways', async () => {
-    const out = await resolveEntitiesEmbed(
+  test('a paper never merges by similarity — only by its exact title', async () => {
+    // This inverts an earlier rule, deliberately. Papers used to be allowed to
+    // match across types on proximity; audited against the live graph, two
+    // genuinely different papers score 0.87, so proximity cannot decide which
+    // paper something is. An exact title match still resolves (byName, below).
+    const fuzzy = await resolveEntitiesEmbed(
       extraction([{ mention: 'Attention Is All You Need', type: 'paper' }]),
-      stubSource({ byVector: [[{ ...node('n1', 'Attention Is All You Need', 'method'), score: 0.95 }]] })
+      stubSource({
+        byVector: [[{ ...node('n1', 'Attention Is All You Need Too', 'paper'), score: 0.95 }]],
+      })
     );
-    assert.equal(out.resolvedEntities[0].canonicalId, 'n1');
+    assert.equal(fuzzy.resolvedEntities[0].isNew, true, 'a near-title is a different paper');
+
+    const exact = await resolveEntitiesEmbed(
+      extraction([{ mention: 'Attention Is All You Need', type: 'paper' }]),
+      stubSource({ byName: [node('n1', 'Attention Is All You Need', 'paper')] })
+    );
+    assert.equal(exact.resolvedEntities[0].canonicalId, 'n1', 'the exact title still resolves');
   });
 
   test('the type rule is pushed down to the source, not only checked after', async () => {

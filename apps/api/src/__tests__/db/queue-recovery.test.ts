@@ -89,18 +89,39 @@ describe('durable queue recovery', { skip: shouldRun ? false : 'TEST_DATABASE_UR
     assert.equal(row.leaseExpiresAt, null);
   });
 
-  test('an interrupted job out of attempts fails honestly', async () => {
-    const id = 'RECOVERTEST-own-exhausted';
+  test('interruptions do NOT spend the failure budget', async () => {
+    // The defect this replaces: `attempts` counted claims, and recovery gated on
+    // MAX_JOB_ATTEMPTS, so three restarts — one afternoon of `tsx watch` —
+    // permanently failed papers that had never thrown. Observed in the wild:
+    // two papers marked "Interrupted and out of retry attempts (3)" with no
+    // handler error recorded anywhere.
+    const id = 'RECOVERTEST-interrupted-often';
     await makeJob(id, {
       owner: queue.INSTANCE_ID,
       leaseExpiresAt: new Date(Date.now() + 60_000),
-      attempts: queue.MAX_JOB_ATTEMPTS,
+      attempts: queue.MAX_JOB_ATTEMPTS + 2,
+    });
+
+    await queue.recoverOnStartup();
+    const row = await rowOf(id);
+    assert.equal(row.status, 'queued', 'interrupted many times is still not failed');
+    assert.equal(row.failures, 0, 'no handler ever threw, so nothing was learned about the work');
+  });
+
+  test('a job claimed past the crash-loop ceiling is given up on', async () => {
+    // The backstop MAX_JOB_ATTEMPTS was accidentally serving: a job that kills
+    // its worker every time must not loop forever.
+    const id = 'RECOVERTEST-poison';
+    await makeJob(id, {
+      owner: queue.INSTANCE_ID,
+      leaseExpiresAt: new Date(Date.now() + 60_000),
+      attempts: queue.MAX_JOB_CLAIMS,
     });
 
     await queue.recoverOnStartup();
     const row = await rowOf(id);
     assert.equal(row.status, 'failed');
-    assert.match(row.error ?? '', /out of retry attempts/);
+    assert.match(row.error ?? '', /poison job/);
   });
 
   test('a queued unowned job needs no recovery at all', async () => {
@@ -169,7 +190,7 @@ describe('durable queue recovery', { skip: shouldRun ? false : 'TEST_DATABASE_UR
     }
   });
 
-  test('a paper whose job exhausted its attempts is reset to failed', async () => {
+  test('a paper whose job hit the crash-loop ceiling is reset to failed', async () => {
     const [paper] = await db
       .insert(schema.papers)
       .values({ title: 'RECOVERTEST dead', domain: 'nlp', processingStatus: 'extracting_entities' })
@@ -178,7 +199,7 @@ describe('durable queue recovery', { skip: shouldRun ? false : 'TEST_DATABASE_UR
     await makeJob(id, {
       owner: queue.INSTANCE_ID,
       leaseExpiresAt: new Date(Date.now() + 60_000),
-      attempts: queue.MAX_JOB_ATTEMPTS,
+      attempts: queue.MAX_JOB_CLAIMS,
       paperId: paper.id,
     });
 

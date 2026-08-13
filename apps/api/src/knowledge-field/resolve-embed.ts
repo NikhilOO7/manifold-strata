@@ -21,6 +21,7 @@ import { embed, cosine } from '../services/embeddings';
 import type { ExtractorOutput } from '../agents/extractor';
 import type { ResolverOutput, ResolvedEntity, ResolvedRelationship } from '../agents/resolver';
 import type { CandidateSource, ScoredCandidate } from './resolve-candidates';
+import { mayMerge, mergeMode } from './merge-guard';
 
 /** Resolver output plus the mention embeddings, keyed by normalized canonical
  * name, so the processor can persist node_vectors without re-embedding. */
@@ -135,6 +136,7 @@ export async function resolveEntitiesEmbed(
 
   // Only mentions with no exact match need the vector search; skipping the rest
   // keeps the k-NN batch as small as the work actually requires.
+  const mode = mergeMode();
   const annIndex: number[] = [];
   const annQueries: Array<{ vector: number[]; type: string }> = [];
   candidates.forEach((cand, i) => {
@@ -143,20 +145,35 @@ export async function resolveEntitiesEmbed(
     annQueries.push({ vector: vectors[i], type: cand.type });
   });
 
-  const annResults = await candidates_.byVector(annQueries);
+  // In `exact` mode the vector search is not merely ignored — it is not run,
+  // because a lookup whose result can never be used is a cost with no purpose.
+  const annResults = mode === 'exact' ? [] : await candidates_.byVector(annQueries);
   const nearestByCandidate = new Map<number, ExistingNode | undefined>();
   annIndex.forEach((candIdx, queryIdx) => {
     const ranked = annResults[queryIdx] ?? [];
     // Re-apply the threshold and the type rule here as well as in SQL. The
     // storage layer constrains the search; this is the rule the resolver is
     // actually accountable for, and it must hold whatever the source returns.
-    const eligible = ranked.filter(
-      (c) =>
-        c.score > SIM_THRESHOLD &&
-        (normalizeType(c.type) === candidates[candIdx].type ||
-          normalizeType(c.type) === 'paper' ||
-          candidates[candIdx].type === 'paper')
-    );
+    const cand = candidates[candIdx];
+    const eligible = ranked.filter((c) => {
+      if (c.score <= SIM_THRESHOLD) return false;
+      const t = normalizeType(c.type);
+      if (t !== cand.type && t !== 'paper' && cand.type !== 'paper') return false;
+
+      // Cosine gets a vote, not a veto. Audited against the live graph, 0.82
+      // sits below the similarity of entities that are plainly different — two
+      // distinct papers score 0.87, English-to-German and English-to-French
+      // score 0.90 — so a merge has to be justifiable by more than proximity.
+      const verdict = mayMerge({ name: cand.mention, type: cand.type }, { name: c.name, type: t });
+      if (!verdict.ok) {
+        console.log(
+          `[resolve] keeping "${cand.mention}" and "${c.name}" apart ` +
+            `(cos ${c.score.toFixed(3)}): ${verdict.reason}`
+        );
+        return false;
+      }
+      return true;
+    });
     // Highest score, not first returned. The source promises ordering; the
     // resolver does not depend on it, so a source that relaxes ordering for
     // speed cannot quietly change which entity a mention resolves to.
@@ -207,10 +224,26 @@ export async function resolveEntitiesEmbed(
       const vec = vectors[i];
       let twin: { name: string; type: EntityType } | undefined;
       let twinScore = SIM_THRESHOLD;
-      for (const prior of freshCanonical) {
-        if (!typesCompatible(prior.type, cand.type)) continue;
-        const score = cosine(vec, prior.vector);
-        if (score > twinScore) {
+      if (mode !== 'exact') {
+        for (const prior of freshCanonical) {
+          if (!typesCompatible(prior.type, cand.type)) continue;
+          const score = cosine(vec, prior.vector);
+          if (score <= twinScore) continue;
+
+          // Same bar as the graph lookup. Two mentions in one chunk are no more
+          // likely to be the same thing than a mention and a stored node —
+          // "GNMT + RL" and "GNMT + RL Ensemble" arrive in the same chunk.
+          const verdict = mayMerge(
+            { name: cand.mention, type: cand.type },
+            { name: prior.name, type: prior.type }
+          );
+          if (!verdict.ok) {
+            console.log(
+              `[resolve] keeping "${cand.mention}" and "${prior.name}" apart ` +
+                `(cos ${score.toFixed(3)}): ${verdict.reason}`
+            );
+            continue;
+          }
           twinScore = score;
           twin = prior;
         }

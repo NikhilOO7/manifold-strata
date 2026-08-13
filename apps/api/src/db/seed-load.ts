@@ -15,6 +15,7 @@
 import 'dotenv/config';
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
+import { sql } from 'drizzle-orm';
 import { nodes, edges, nodeVectors, propositions, papers } from './schema';
 import { EMBEDDING_SPACE } from '../services/embedding-space';
 
@@ -80,6 +81,21 @@ async function main() {
       processingStatus: 'completed',
     })
     .returning();
+
+  // Clear any previous fixture first.
+  //
+  // Without this the generator is additive: running it twice produced 100,000
+  // rows over 50,000 distinct names, because every run restarts its counter at
+  // zero. The corpus then no longer describes what it claims to — and, since
+  // entity identity is unique per domain (migration 0008), it is not a corpus
+  // the system could ever actually hold. A fixture that cannot exist in
+  // production is not measuring production.
+  const [cleared] = (await db.execute(sql`
+    with gone as (delete from nodes where name like 'LOADTEST%' returning 1)
+    select count(*)::int as n from gone
+  `)) as unknown as Array<{ n: number }>;
+  if (cleared.n > 0) console.log(`Cleared ${cleared.n} node(s) from a previous seed.`);
+  await db.execute(sql`delete from papers where title like 'LOADTEST%'`);
 
   const BATCH = 1000;
   const nodeIds: string[] = [];

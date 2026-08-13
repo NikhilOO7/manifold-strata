@@ -15,6 +15,9 @@ export const processingStatusEnum = pgEnum('processing_status', [
   'extracting_entities',
   'resolving_entities',
   'validating',
+  // Stopped between chunks at an operator's request. Distinct from 'failed':
+  // nothing went wrong, and the checkpoint means resuming costs nothing.
+  'paused',
   'completed',
   'failed'
 ]);
@@ -25,6 +28,9 @@ export const jobStatusEnum = pgEnum('job_status', [
   'downloading_pdf',
   'extracting_text',
   'processing',
+  // Parked by an operator. Terminal for the queue (nothing claims it) but not a
+  // failure — the checkpoint is intact and resuming re-queues it for free.
+  'paused',
   'completed',
   'failed'
 ]);
@@ -127,10 +133,75 @@ export const sources = pgTable('sources', {
   extractedText: text('extracted_text'),
   spanStart: integer('span_start'),
   spanEnd: integer('span_end'),
+  // Which chunk produced this claim. Without it, "undo one chunk" is impossible
+  // and the only safe retry is to wipe the whole paper and start at zero.
+  chunkIndex: integer('chunk_index'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 }, (table) => ({
   edgeIdIdx: index('sources_edge_id_idx').on(table.edgeId),
   paperIdIdx: index('sources_paper_id_idx').on(table.paperId),
+  paperChunkIdx: index('sources_paper_chunk_idx').on(table.paperId, table.chunkIndex),
+}));
+
+/**
+ * Per-chunk checkpoint: what a paper has already extracted.
+ *
+ * Extraction is ~34s of GPU per chunk and a paper is ~26 chunks, so a failure at
+ * chunk 24 used to throw away fifteen minutes of correct work — the retry
+ * cleared the paper's whole contribution and started at chunk 0. That is only
+ * the right shape if you cannot attribute work to a chunk. With this table you
+ * can, so a retry resumes and a pause is lossless.
+ *
+ * `contentHash` guards the one assumption resume depends on: that chunk N means
+ * the same text it meant last time. Chunking is deterministic given the source
+ * text, so if the text changes the boundaries move and every checkpoint is
+ * meaningless — better to detect that and redo the paper than to resume onto
+ * different content and silently mis-attribute evidence.
+ */
+export const paperChunks = pgTable('paper_chunks', {
+  paperId: uuid('paper_id').notNull().references(() => papers.id, { onDelete: 'cascade' }),
+  chunkIndex: integer('chunk_index').notNull(),
+  status: text('status').notNull().default('completed'),
+  contentHash: text('content_hash').notNull(),
+  section: text('section'),
+  entities: integer('entities').default(0).notNull(),
+  relationships: integer('relationships').default(0).notNull(),
+  error: text('error'),
+  completedAt: timestamp('completed_at').defaultNow().notNull(),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.paperId, table.chunkIndex] }),
+  paperIdx: index('paper_chunks_paper_idx').on(table.paperId),
+}));
+
+/**
+ * Graph-quality proposals, produced by the background audit.
+ *
+ * Findings are stored rather than acted on. The doctrine that governs merging
+ * governs cleaning with more force: a false merge destroys a distinction, and a
+ * false *drop* destroys the evidence too, with no record it ever existed. So the
+ * audit writes what it believes and why, and applying is a separate act.
+ *
+ * `dismissed` rows are kept deliberately. Without them the next audit
+ * re-proposes what a human already rejected, and a tool that keeps asking the
+ * same question gets ignored — which is how a quality system stops working
+ * without anyone deciding to switch it off.
+ */
+export const graphFindings = pgTable('graph_findings', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  domain: text('domain').notNull(),
+  nodeId: uuid('node_id').notNull().references(() => nodes.id, { onDelete: 'cascade' }),
+  /** For a merge, the node that should survive. */
+  relatedNodeId: uuid('related_node_id').references(() => nodes.id, { onDelete: 'cascade' }),
+  detector: text('detector').notNull(),
+  verdict: text('verdict').notNull(),
+  reason: text('reason').notNull(),
+  confidence: text('confidence').notNull(),
+  status: text('status').notNull().default('proposed'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  resolvedAt: timestamp('resolved_at'),
+}, (table) => ({
+  domainStatusIdx: index('graph_findings_domain_status_idx').on(table.domain, table.status),
+  nodeIdx: index('graph_findings_node_idx').on(table.nodeId),
 }));
 
 /**
@@ -160,7 +231,7 @@ export const batches = pgTable('batches', {
 // and a restart resumes the backlog instead of orphaning it.
 export const jobs = pgTable('jobs', {
   id: text('id').primaryKey(),                     // "job-{timestamp}-{counter}-{random}"
-  type: text('type').notNull(),                    // 'ingest' | 'process'
+  type: text('type').notNull(),                    // 'ingest' | 'process' | 'audit'
   status: jobStatusEnum('status').default('queued').notNull(),
   paperId: uuid('paper_id').references(() => papers.id, { onDelete: 'set null' }),
   progress: text('progress'),                      // human-readable status message
@@ -177,6 +248,10 @@ export const jobs = pgTable('jobs', {
   leaseExpiresAt: timestamp('lease_expires_at'),
   /** Times this job has been claimed. Retried until MAX_JOB_ATTEMPTS, then failed. */
   attempts: integer('attempts').default(0).notNull(),
+  // Handler failures, counted separately from claims. A restart that interrupts
+  // a job is not evidence the job is bad, so it must not spend the budget meant
+  // for work that actually ran and threw. See queue/index.ts.
+  failures: integer('failures').default(0).notNull(),
   batchId: uuid('batch_id').references(() => batches.id, { onDelete: 'set null' }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),

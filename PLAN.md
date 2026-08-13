@@ -514,6 +514,31 @@ operator knows what is coming back.
 **Honest limits:** resolution's threshold (0.82) and type rule are still chosen by inspection rather than by a
 harness. A false merge is harder to detect than a false split; that measurement is the next item.
 
+### Phase 4e — Checkpointed extraction, and controls for it · **shipped**
+
+A 26-chunk paper that failed at chunk 24 discarded all 23 correct extractions and started at chunk 0. That was
+the *right* call while an edge could not be attributed to a chunk — the only provably-safe undo was "undo
+everything" — but it cost fifteen minutes of GPU per retry, and retries are common.
+
+- `sources.chunk_index` makes every claim attributable, and `paper_chunks` records what completed with a
+  content hash. `resumePaper` keeps finished chunks and clears only what it is about to redo, so idempotency
+  holds at the finer grain. Proven end to end: killed a run, dropped one checkpoint, resumed — the processor
+  logged `resuming: 1/2 chunk(s) already extracted, skipping them`, ran only chunk 2, and produced **zero**
+  duplicate edges.
+- The content hash is the guard that matters. Chunking is deterministic given the source text, so if the text
+  changes the boundaries move and every checkpoint is meaningless — resuming onto different content would
+  silently mis-attribute evidence, which is worse than redoing the work.
+- **Pause/resume**: cooperative, checked between chunks, never mid-chunk. The job goes to a `paused` state that
+  is terminal for the queue and consumes no retry — marking a deliberate pause as `failed` is the same category
+  of lie as showing a failed paper as "Pending".
+- **Retry is resume.** One endpoint, because they are one operation. `?rebuild=true` opts into the old
+  start-over semantics for when the extractor or model actually changed.
+- Dashboard gained Retry / Pause / Resume controls. A failure with no button is an outage.
+
+**Honest limit:** propositions carry no chunk attribution, so a partial resume keeps the propositions from
+completed chunks rather than rewriting them. Correct, but it means proposition-level dedup relies on the
+chunk-level undo being right.
+
 ### Phase 5 — Agent intelligence
 
 Tool-ranking endpoint, precondition and dependency edges, contradiction detection, temporal "as of" queries,

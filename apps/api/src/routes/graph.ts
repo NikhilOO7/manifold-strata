@@ -1,11 +1,20 @@
 import { Hono, type Context } from 'hono';
 import { db } from '../db';
-import { nodes, edges, sources, papers, propositions } from '../db/schema';
+import { nodes, edges, sources, papers, propositions, graphFindings } from '../db/schema';
 import { eq, sql, ilike, and, or, inArray, type SQL } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/pg-core';
-import { resolveStoredDomain } from '../domains';
+import { resolveStoredDomain, DEFAULT_DOMAIN_ID } from '../domains';
+import {
+  ROLE_ORDER,
+  roleForEdgeType,
+  roleForIncomingEdgeType,
+  invertPhrase,
+  type LensRole,
+} from '../knowledge-field/lens';
 import { domainWhere } from '../domains/filter';
-import { requireDomain } from '../middleware/auth';
+import { requireDomain, requireScopeOn } from '../middleware/auth';
+import { createJob } from '../queue';
+import { applyFinding, dismissFindings } from '../quality/audit';
 import { routeError, isUuid } from './errors';
 
 export const graphRouter = new Hono();
@@ -311,6 +320,390 @@ graphRouter.get('/stats', async (c) => {
 // Distinct node/edge types actually present in the graph. Lets the UI populate
 // type filters dynamically instead of from a hardcoded list, so newly discovered
 // types appear automatically.
+/**
+ * The most-connected entities in a domain — ranked by the database.
+ *
+ * The Explorer used to build this list itself: fetch up to 500 nodes and 500
+ * edges, count degrees in JavaScript, show the top 14. That is wrong in two ways
+ * that compound. The display cap hides entities, which is merely annoying. The
+ * *sample* cap makes the ranking itself false — degree counted over an arbitrary
+ * 500 edges is not degree, so past a few hundred edges the "most connected"
+ * entities are simply whichever hubs happened to fall inside the window. It is
+ * the same defect class as ranking over a candidate window instead of an index.
+ *
+ * Counting in SQL over the whole domain makes the answer true at any size, and
+ * costs one indexed aggregate rather than shipping two full tables to the
+ * browser to be re-counted there.
+ */
+/**
+ * Every paper in a domain, as an entry point with enough signal to choose one.
+ */
+graphRouter.get('/papers', async (c) => {
+  try {
+    const raw = c.req.query('domain');
+    const domainId = raw ? requireDomain(c, raw, 'graph.papers').id : null;
+    const domainSql = domainId
+      ? domainId === DEFAULT_DOMAIN_ID
+        ? sql`and (n.domain = ${domainId} or n.domain is null)`
+        : sql`and n.domain = ${domainId}`
+      : sql``;
+
+    // Only papers that are actually ingested documents.
+    //
+    // `type = 'paper'` alone is far too wide: the extractor creates a paper node
+    // for every work a document *cites*, so seven ingested papers produced
+    // eighty-five paper nodes — seventy-four of them citation targets like
+    // "arXiv preprint arXiv:1601.06733", with no text of their own and nothing
+    // to study. A lens whose whole purpose is "choose one of your documents"
+    // must not offer them.
+    //
+    // The discriminator is exact rather than heuristic: `getOrCreatePaperNode`
+    // stamps a document's own node with `paper_id` pointing at itself and
+    // `normalized_name` equal to its title. A citation target carries the
+    // *citing* paper's id, so it cannot satisfy both halves.
+    const rows = (await db.execute(sql`
+      select n.id, n.name, n.domain,
+             count(*) filter (where e.type = 'mentions')::int as concepts,
+             count(*) filter (where e.type <> 'mentions')::int as relationships
+      from ${nodes} n
+      left join ${edges} e on e.source_id = n.id
+      where n.type = 'paper' ${domainSql}
+        and exists (
+          select 1 from ${papers} p
+          where p.id = n.paper_id and lower(p.title) = n.normalized_name
+        )
+      group by n.id, n.name, n.domain
+      order by count(*) desc, n.name
+    `)) as unknown as Array<{
+      id: string;
+      name: string;
+      domain: string | null;
+      concepts: number;
+      relationships: number;
+    }>;
+
+    return c.json({ papers: rows });
+  } catch (error) {
+    return routeError(c, error, 'Failed to fetch papers');
+  }
+});
+
+/**
+ * One node read as an argument: its edges grouped by the question they answer.
+ *
+ * Both directions are included and inverted correctly — "A extends B" is part of
+ * A's lineage and part of B's legacy, and filing an incoming `extends` under
+ * "Builds on" would tell the reader the opposite of what happened.
+ */
+graphRouter.get('/lens/:id', async (c) => {
+  try {
+    const id = c.req.param('id');
+    if (!isUuid(id)) return c.json({ error: 'Node not found' }, 404);
+
+    const [node] = await db.select().from(nodes).where(eq(nodes.id, id)).limit(1);
+    if (!node) return c.json({ error: 'Node not found' }, 404);
+
+    // Traversal is pinned to the centre node's own domain (invariant 2).
+    const nodeDomain = resolveStoredDomain(node.domain, `lens node ${node.id}`).id;
+    const raw = c.req.query('domain');
+    if (raw && requireDomain(c, raw, 'graph.lens').id !== nodeDomain) {
+      return c.json({ error: 'Node not found' }, 404);
+    }
+    requireDomain(c, nodeDomain, 'graph.lens');
+
+    const target = alias(nodes, 'target');
+    const source = alias(nodes, 'source');
+
+    const [outgoing, incoming] = await Promise.all([
+      db
+        .select({ edge: edges, other: target })
+        .from(edges)
+        .innerJoin(target, eq(edges.targetId, target.id))
+        .where(and(eq(edges.sourceId, id), domainWhere(target.domain, nodeDomain))),
+      db
+        .select({ edge: edges, other: source })
+        .from(edges)
+        .innerJoin(source, eq(edges.sourceId, source.id))
+        .where(and(eq(edges.targetId, id), domainWhere(source.domain, nodeDomain))),
+    ]);
+
+    interface Item {
+      id: string;
+      name: string;
+      type: string;
+      relation: string;
+      direction: 'out' | 'in';
+      evidence: string | null;
+    }
+    const buckets = new Map<LensRole, Item[]>();
+    const push = (role: LensRole, item: Item) => {
+      const list = buckets.get(role) ?? [];
+      list.push(item);
+      buckets.set(role, list);
+    };
+
+    // Evidence for every edge shown, in one query — the sentence is what turns
+    // a claim into something a reader can check rather than take on faith.
+    const edgeIds = [...outgoing, ...incoming].map((r) => r.edge.id);
+    const evidenceByEdge = new Map<string, string>();
+    if (edgeIds.length > 0) {
+      const rows = await db
+        .select({ edgeId: sources.edgeId, text: sources.extractedText })
+        .from(sources)
+        .where(inArray(sources.edgeId, edgeIds));
+      for (const r of rows) {
+        if (r.text && !evidenceByEdge.has(r.edgeId)) evidenceByEdge.set(r.edgeId, r.text);
+      }
+    }
+
+    for (const row of outgoing) {
+      push(roleForEdgeType(row.edge.type), {
+        id: row.other.id,
+        name: row.other.name,
+        type: row.other.type,
+        relation: row.edge.type.replace(/_/g, ' '),
+        direction: 'out',
+        evidence: evidenceByEdge.get(row.edge.id) ?? null,
+      });
+    }
+    for (const row of incoming) {
+      push(roleForIncomingEdgeType(row.edge.type), {
+        id: row.other.id,
+        name: row.other.name,
+        type: row.other.type,
+        relation: invertPhrase(row.edge.type),
+        direction: 'in',
+        evidence: evidenceByEdge.get(row.edge.id) ?? null,
+      });
+    }
+
+    return c.json({
+      node: { id: node.id, name: node.name, type: node.type, description: node.description },
+      domain: nodeDomain,
+      // Fixed order: the order the questions get asked, not by size.
+      sections: ROLE_ORDER.filter((r) => (buckets.get(r.role) ?? []).length > 0).map((r) => ({
+        ...r,
+        items: buckets.get(r.role) ?? [],
+      })),
+      total: outgoing.length + incoming.length,
+    });
+  } catch (error) {
+    return routeError(c, error, 'Failed to build lens');
+  }
+});
+
+/**
+ * What two papers share, and what only one of them has.
+ *
+ * This is the between-papers question, and it is answerable only because every
+ * entity is attached to the paper that named it: the shared set is the
+ * intersection of two papers' mention edges. Before that existed, two papers had
+ * no path between them at all.
+ */
+graphRouter.get('/compare', async (c) => {
+  try {
+    const aId = c.req.query('a');
+    const bId = c.req.query('b');
+    if (!aId || !bId || !isUuid(aId) || !isUuid(bId)) {
+      return c.json({ error: 'Provide two node ids as ?a= and ?b=' }, 400);
+    }
+
+    const both = await db.select().from(nodes).where(inArray(nodes.id, [aId, bId]));
+    const a = both.find((n) => n.id === aId);
+    const b = both.find((n) => n.id === bId);
+    if (!a || !b) return c.json({ error: 'Node not found' }, 404);
+
+    const domainA = resolveStoredDomain(a.domain, `compare node ${a.id}`).id;
+    const domainB = resolveStoredDomain(b.domain, `compare node ${b.id}`).id;
+    requireDomain(c, domainA, 'graph.compare');
+    if (domainA !== domainB) {
+      // Not an error the caller can act on by retrying — and saying "different
+      // domains" is more useful than an empty intersection that looks like the
+      // two papers happen to have nothing in common.
+      return c.json(
+        {
+          error:
+            'These papers are in different domains, so they share nothing by construction. ' +
+            'Move one with POST /api/papers/:id/domain to compare them.',
+        },
+        409
+      );
+    }
+
+    const neighbours = async (id: string) =>
+      db
+        .select({ id: nodes.id, name: nodes.name, type: nodes.type })
+        .from(edges)
+        .innerJoin(nodes, eq(edges.targetId, nodes.id))
+        .where(and(eq(edges.sourceId, id), domainWhere(nodes.domain, domainA)));
+
+    const [na, nb] = await Promise.all([neighbours(aId), neighbours(bId)]);
+    const setB = new Map(nb.map((n) => [n.id, n]));
+    const setA = new Map(na.map((n) => [n.id, n]));
+
+    return c.json({
+      a: { id: a.id, name: a.name },
+      b: { id: b.id, name: b.name },
+      shared: na.filter((n) => setB.has(n.id)),
+      onlyA: na.filter((n) => !setB.has(n.id)),
+      onlyB: nb.filter((n) => !setA.has(n.id)),
+    });
+  } catch (error) {
+    return routeError(c, error, 'Failed to compare');
+  }
+});
+
+/**
+ * Queue a graph-quality audit. Returns immediately; the work is a durable job.
+ */
+graphRouter.post('/audit', async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}) as { domain?: string });
+    const domain = requireDomain(c, body.domain, 'graph.audit');
+    requireScopeOn(c, 'write', 'graph.audit');
+
+    const jobId = `job-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    await createJob(jobId, 'audit', { metadata: { domain: domain.id } });
+
+    return c.json(
+      {
+        message: `Audit queued for "${domain.id}". It writes proposals; nothing is changed.`,
+        domain: domain.id,
+        jobId,
+        findingsUrl: `/api/graph/findings?domain=${domain.id}`,
+      },
+      202
+    );
+  } catch (error) {
+    return routeError(c, error, 'Failed to queue audit');
+  }
+});
+
+/** What the last audit proposed, worst first. */
+graphRouter.get('/findings', async (c) => {
+  try {
+    const domain = requireDomain(c, c.req.query('domain'), 'graph.findings');
+    const status = c.req.query('status') ?? 'proposed';
+
+    const node = alias(nodes, 'subject');
+    const related = alias(nodes, 'related');
+    const rows = await db
+      .select({
+        id: graphFindings.id,
+        detector: graphFindings.detector,
+        verdict: graphFindings.verdict,
+        reason: graphFindings.reason,
+        confidence: graphFindings.confidence,
+        status: graphFindings.status,
+        node: { id: node.id, name: node.name, type: node.type },
+        related: { id: related.id, name: related.name, type: related.type },
+      })
+      .from(graphFindings)
+      .innerJoin(node, eq(graphFindings.nodeId, node.id))
+      .leftJoin(related, eq(graphFindings.relatedNodeId, related.id))
+      .where(and(eq(graphFindings.domain, domain.id), eq(graphFindings.status, status)))
+      // Confidence first so the safest proposals are read first, and an operator
+      // working top-down is not asked to adjudicate the hard cases while warming up.
+      .orderBy(
+        sql`case ${graphFindings.confidence} when 'high' then 0 when 'medium' then 1 else 2 end`,
+        graphFindings.detector
+      )
+      .limit(500);
+
+    const counts = (await db.execute(sql`
+      select verdict, confidence, count(*)::int as n
+      from ${graphFindings}
+      where domain = ${domain.id} and status = 'proposed'
+      group by 1, 2
+    `)) as unknown as Array<{ verdict: string; confidence: string; n: number }>;
+
+    return c.json({ domain: domain.id, findings: rows, summary: counts });
+  } catch (error) {
+    return routeError(c, error, 'Failed to fetch findings');
+  }
+});
+
+/** Carry out one proposal, or record that a human disagreed with several. */
+graphRouter.post('/findings/apply', async (c) => {
+  try {
+    const body = (await c.req.json().catch(() => ({}))) as {
+      domain?: string;
+      apply?: string[];
+      dismiss?: string[];
+    };
+    const domain = requireDomain(c, body.domain, 'graph.findings.apply');
+    requireScopeOn(c, 'write', 'graph.findings.apply');
+
+    // Every id is checked to belong to this domain before it is touched — a
+    // finding id is otherwise a way to delete a node in a domain you cannot read.
+    const ids = [...(body.apply ?? []), ...(body.dismiss ?? [])];
+    if (ids.length === 0) return c.json({ error: 'Nothing to do' }, 400);
+
+    const owned = await db
+      .select({ id: graphFindings.id })
+      .from(graphFindings)
+      .where(and(inArray(graphFindings.id, ids), eq(graphFindings.domain, domain.id)));
+    const ownedIds = new Set(owned.map((r) => r.id));
+    const foreign = ids.filter((id) => !ownedIds.has(id));
+    if (foreign.length > 0) return c.json({ error: 'Finding not found' }, 404);
+
+    const applied: string[] = [];
+    const failed: Array<{ id: string; error: string }> = [];
+    for (const id of body.apply ?? []) {
+      try {
+        await applyFinding(id);
+        applied.push(id);
+      } catch (err) {
+        failed.push({ id, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+    const dismissed = await dismissFindings(body.dismiss ?? []);
+
+    return c.json({ applied: applied.length, dismissed, failed });
+  } catch (error) {
+    return routeError(c, error, 'Failed to resolve findings');
+  }
+});
+
+graphRouter.get('/hubs', async (c) => {
+  try {
+    const raw = c.req.query('domain');
+    const domainId = raw ? requireDomain(c, raw, 'graph.hubs').id : null;
+    const type = c.req.query('type');
+    const rawLimit = parseInt(c.req.query('limit') || '25', 10);
+    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 200) : 25;
+
+    const domainSql = domainId
+      ? domainId === DEFAULT_DOMAIN_ID
+        ? sql`and (n.domain = ${domainId} or n.domain is null)`
+        : sql`and n.domain = ${domainId}`
+      : sql``;
+    const typeSql = type ? sql`and n.type = ${type}` : sql``;
+
+    const rows = (await db.execute(sql`
+      select n.id, n.name, n.type, n.domain,
+             count(e.id)::int as degree
+      from ${nodes} n
+      left join ${edges} e on e.source_id = n.id or e.target_id = n.id
+      where true ${domainSql} ${typeSql}
+      group by n.id, n.name, n.type, n.domain
+      having count(e.id) > 0
+      order by count(e.id) desc, n.name asc
+      limit ${limit}
+    `)) as unknown as Array<{
+      id: string;
+      name: string;
+      type: string;
+      domain: string | null;
+      degree: number;
+    }>;
+
+    return c.json({ hubs: rows, limit });
+  } catch (error) {
+    return routeError(c, error, 'Failed to fetch most-connected entities');
+  }
+});
+
 graphRouter.get('/types', async (c) => {
   try {
     const raw = c.req.query('domain');

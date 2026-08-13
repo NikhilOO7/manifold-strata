@@ -207,14 +207,16 @@ VITE_API_URL=http://localhost:3000
 | `AUTH_MODE` | — | `required` enforces scoped credentials on every `/api` route. Unset = auth disabled (dev) |
 | `MCP_DOMAINS` | — | Comma-separated domains the MCP server may read. Unset = all |
 | `FETCH_CONCURRENCY` | `2` | Ingest-lane workers (network/CPU: metadata, PDF, parse) |
-| `PROCESS_CONCURRENCY` | `1` | Process-lane workers (GPU extraction; >1 on one GPU buys queueing, not speed) |
+| `PROCESS_CONCURRENCY` | `1` | Process-lane workers (GPU extraction). A conservative default, not a measured optimum — run `pnpm --filter api bench:lane-width` on the target hardware to decide it. |
 | `MAX_PENDING_JOBS` | `500` | Admission ceiling — bulk requests beyond it get `429` with the current depth |
-| `MAX_JOB_ATTEMPTS` | `3` | Claims per job before an interrupted/failing job is failed for good |
+| `MAX_JOB_ATTEMPTS` | `3` | Handler **failures** before a job is given up on. Interruptions do not count against it. |
+| `MAX_JOB_CLAIMS` | `25` | Total claims before a job is treated as a poison pill (crash-loop backstop) |
 | `VITE_API_URL` | `http://localhost:3000` | API base URL for the web app |
 | `CORS_ORIGINS` | localhost 5173/5174/3000 | Comma-separated allowed origins |
 | `INSTANCE_ID` | `<hostname>:<port>` | Identity used for job ownership; must differ between concurrent instances |
 | `TRUSTED_PROXY_HOPS` | `0` | Proxies you control in front of the API. `0` ignores `X-Forwarded-For` entirely |
 | `RESOLUTION_ANN_K` | `8` | Neighbours fetched per mention from the HNSW index during resolution |
+| `RESOLUTION_MERGE` | `guarded` | `exact` = only identical names merge (zero false merges); `guarded` = embedding matches must pass the merge guard; `vector` = cosine alone (audited unsafe — two distinct papers score 0.87) |
 | `RESOLUTION_CANDIDATE_LIMIT` | `2000` | **Legacy pipeline only** — nodes shown to the LLM resolver, bounded by prompt size. The field pipeline reads the index and has no window. |
 | `SHUTDOWN_GRACE_MS` | `10000` | How long SIGTERM waits for in-flight jobs before leaving them to lease recovery |
 | `LLM_UNAVAILABLE_ABORT_AFTER` | `3` | Consecutive unreachable-model chunk failures before abandoning a paper |
@@ -430,7 +432,16 @@ All graph read endpoints accept an optional `?domain=` filter; omit it to span e
 - `POST /api/ingest/bulk` — ingest up to 100 papers (optional `domain`) *(auth)*
 - `GET /api/ingest/status/:jobId` — durable job status
 - `GET /api/ingest/batches/:id` — batch progress, computed from member jobs (`counts`, `complete`)
+- `GET /api/papers/processing` — in-flight papers, each with `queue: { state: 'running' | 'queued' | 'unscheduled', position }`, plus the configured lane width. `processingStatus` alone cannot distinguish "a worker will take this" from "nothing is scheduled", and rendering both as *Pending* made a working queue look idle.
 - `GET /api/ingest/batches` — recent batches with per-status counts
+- `POST /api/papers/:id/pause` — stop cleanly after the current chunk
+- `POST /api/papers/:id/resume` — resume or retry from the last checkpoint (`?rebuild=true` to start over)
+- `GET /api/papers/:id/chunks` — per-chunk progress: what extracted, what is left, what failed
+- `POST /api/papers/:id/domain` — move a paper to another domain and rebuild its contribution there
+- `GET /api/graph/papers?domain=` — papers as entry points, with concept and claim counts
+- `GET /api/graph/lens/:id` — one node read as an argument: edges grouped by the question they answer (introduces / builds on / uses / validated on / compared with / covers), each with its evidence sentence
+- `GET /api/graph/compare?a=&b=` — what two papers share and where they diverge
+- `GET /api/graph/hubs?domain=&type=&limit=` — most-connected entities, ranked **by the database** over the whole domain. The UI used to fetch 500 nodes + 500 edges and count degrees client-side, which made the ranking false past a few hundred edges (degree over an arbitrary sample is not degree).
 - `GET /api/ingest/seed/:domain` — curated seed arXiv IDs for a domain
 
 ### Admin *(admin scope)*
@@ -518,6 +529,7 @@ pnpm --filter api eval                    # recall / nDCG / MRR vs vector and ke
 pnpm --filter api eval -- --sweep-alpha   # tune PPR restart against measured quality
 pnpm --filter api seed:load -- --nodes 100000
 pnpm --filter api bench:retrieval         # latency A/B against the previous whole-corpus path
+pnpm --filter api bench:lane-width        # serial vs concurrent extraction on this hardware
 ```
 
 On a constructed corpus with known answers:
@@ -562,6 +574,10 @@ SQL, not above it.
 - **Auth is a data boundary, not an authorization boundary** — domains isolate *data*, but a single shared `API_KEY` grants access to all of them, and read routes are unauthenticated. Per-domain permissions need per-user keys/JWT (see below).
 - **Status updates are polled** — the Dashboard/Ingestion pages poll every ~2s. Server-Sent Events would push updates and cut idle DB load.
 - **Retrieval is fast but not yet proven at millions of entities** — pgvector + HNSW with a bounded working set measures 153 ms p50 / 193 ms p95 on a 100,000-entity corpus (down from 21 s). Latency still grows with corpus size through buffer-cache pressure; `halfvec`, a lower `hnsw.ef_search`, and fewer dimensions are the next levers. Reproduce with `pnpm --filter api seed:load` and `bench:retrieval`.
+- **Domain moves take the paper's nodes with them** — clearing contribution keeps nodes (they are shared within a domain), which is wrong across a move: the nodes carry the old domain stamp while the paper has left. `repair:domain-drift` audits and fixes it; on this corpus it removed 535 drifted nodes.
+- **One live process job per paper** — a partial unique index, because two routes could schedule a paper and only one remembered to check. Observed live: four papers with two queued jobs each, one already extracting. Both would clear the other's work mid-rebuild.
+- **Entity identity is a database constraint** — a unique index on `(domain, normalized_name)` plus an atomic upsert, because resolution's lookups cannot prevent a race between two workers. Demonstrated before the fix: two concurrent transactions, two identical nodes. Eight concurrent writers now produce one node and all eight receive the same id.
+- **Entity merging is guarded, and deliberately conservative** — an audit of the live graph found that *every* same-type pair above the old 0.82 cosine threshold was a pair of genuinely different things (two distinct papers at 0.87, English-to-German vs English-to-French at 0.90, a model vs its ensemble at 0.92). Cosine alone cannot decide identity, so [merge-guard.ts](apps/api/src/knowledge-field/merge-guard.ts) requires a justification: papers match only on exact title, numbers must agree, and the difference between two names must be a generic word rather than a distinguishing one. All 7 above-threshold pairs in the corpus are now kept apart, each with a logged reason, and retrieval quality is unchanged (nDCG 87.7%).
 - **Resolution quality is unmeasured** — it now reads the whole domain through the index, so *which* candidates it sees is no longer a question. What is still unproven is the threshold: 0.82 cosine and the same-type rule were chosen by inspection, not by a harness like the one that governs retrieval. A false merge (two entities becoming one) is harder to notice after the fact than a false split, so this is the next thing worth measuring.
 - **Domains are strictly isolated, with no cross-domain bridges** — each node lives in exactly one domain (see [Domains](#domains-multi-field-isolation)), so a concept studied in two fields becomes two nodes. A future "shared" namespace or a `domains text[]` tag could link them where it's genuinely the same entity. Domains are also config-as-code; a DB-editable registry + per-domain type-compatibility rules are natural extensions.
 - **Hyperbolic/community layers are batch** — `train-hyperbolic` and `communities/build` are run on demand, not incrementally maintained as papers arrive.

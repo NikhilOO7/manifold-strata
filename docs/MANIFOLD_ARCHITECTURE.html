@@ -248,6 +248,8 @@ hr.soft{border:none;border-top:1px solid var(--border);margin:34px 0}
   <a class="toc-link" href="#s17"><span class="toc-num">17</span><span>Failure honesty as a feature</span></a>
 
   <div class="toc-part">III · The read path</div>
+  <a class="toc-link" href="#s17b"><span class="toc-num">17b</span><span>Graph density: when the graph is not the problem</span></a>
+  <a class="toc-link" href="#s17c"><span class="toc-num">17c</span><span>The graph-quality audit: a cleaner that proposes</span></a>
   <a class="toc-link" href="#s18"><span class="toc-num">18</span><span>Retrieval on one page</span></a>
   <a class="toc-link" href="#s19"><span class="toc-num">19</span><span>Query embedding &amp; space integrity</span></a>
   <a class="toc-link" href="#s20"><span class="toc-num">20</span><span>ANN seeds, and HNSW properly</span></a>
@@ -1224,6 +1226,48 @@ hr.soft{border:none;border-top:1px solid var(--border);margin:34px 0}
         <tr><td><strong>23</strong></td><td><strong>Retrieval tuning is decided by the harness, not by argument.</strong> Run <code>pnpm --filter api eval</code> before and after any change to PPR, MMR, fusion weights, seed count, or hop limits.</td>
             <td>Two tuning decisions have already been <em>reversed</em> by measurement (ch. 49). Both sounded correct.</td>
             <td><code>--sweep-alpha</code> and <code>--sweep-weights</code> are built in; the reasoning is recorded in <code>ppr.ts</code> for the next person with the same idea.</td></tr>
+        <tr><td><strong>24</strong></td><td><strong>Entity resolution reads the index, never a window.</strong> Candidates come from one batched equality probe on <code>nodes_normalized_name_idx</code> and one batched k-NN lateral over <code>node_vectors_embedding_hnsw</code>, both domain-scoped. Filtered ANN asks for <code>hnsw.iterative_scan</code>.</td>
+            <td>A "most recent N nodes" preload made identity depend on creation order: past N, a domain forked entities it already contained and only logged about it. And <code>ilike</code> where <code>eq</code> was meant was a Seq Scan discarding all 100,000 rows (cost 3039) against an index scan at cost 12.</td>
+            <td>DB suite seeds <strong>2,500</strong> nodes — more than the old window — and demands the oldest entity still resolve, in-domain only.</td></tr>
+        <tr><td><strong>25</strong></td><td><strong>A signal is a shutdown, not a crash.</strong> SIGTERM/SIGINT close the server, stop claiming, drain for <code>SHUTDOWN_GRACE_MS</code>, then close the pool — and never release still-running claims.</td>
+            <td>Releasing a live claim lets another instance run the same extraction concurrently. Nothing handled SIGTERM at all, so every deploy was a crash.</td>
+            <td>Handlers installed at boot; verified live (clean drain, port released). Expiry is the safe handover, and it is bounded.</td></tr>
+        <tr><td><strong>26</strong></td><td><strong>A pause is not a failure.</strong> Pausing stops at the next chunk boundary — never mid-chunk. The job takes a <code>paused</code> state: terminal for the queue, no retry consumed.</td>
+            <td>Recording a deliberate pause as <code>failed</code> is the same category of lie as showing a failed paper as "Pending" — a state the system knows, reported as something else.</td>
+            <td>Own enum value in both <code>processing_status</code> and <code>job_status</code>; DB tests assert a paused job is never claimed or owned.</td></tr>
+        <tr><td><strong>27</strong></td><td><strong>A state the operator must clear belongs in the operations view.</strong> <code>GET /api/papers/processing</code> returns <code>failed</code> and <code>paused</code>, not only in-flight papers.</td>
+            <td>Excluding them put the Retry and Resume controls in a list that could never contain a paper needing them. The buttons existed and were unreachable. A failure with no control is an outage.</td>
+            <td>DB tests assert the view distinguishes <code>queued</code> / <code>running</code> / <code>unscheduled</code> and reports lane width.</td></tr>
+        <tr><td><strong>28</strong></td><td><strong>Proximity is not identity — a merge must be justifiable.</strong> <code>merge-guard.ts</code> approves every embedding merge: papers by exact title only, numbers must match, the unshared part must be generic rather than distinguishing, initialisms exempt.</td>
+            <td>Audited on the live graph, <em>every</em> same-type pair above 0.82 was two different things — two papers at 0.870, English-to-German vs -French at 0.904, a model vs its ensemble at 0.917. No threshold separates those from synonyms: the embedding measures topic, and identity is not topic.</td>
+            <td>26 unit tests using the real observed names, both directions. Never widen <code>GENERIC_TOKENS</code> without re-running the live audit.</td></tr>
+        <tr><td><strong>29</strong></td><td><strong>An entity with no edge is not knowledge.</strong> Every entity a chunk names gets <code>paper -[mentions]-&gt; entity</code>, chunk-attributed like any other claim.</td>
+            <td>The extractor returns entities and relationships as separate lists, so anything it did not put in a relationship became a node with no edges — measured at <strong>62% of the graph</strong>. Present in the corpus, absent from the knowledge.</td>
+            <td><code>backfill:mentions</code> repairs older corpora: 132 → 552 edges, isolation 62.4% → 3.6%, retrieval quality unchanged.</td></tr>
+        <tr><td><strong>30</strong></td><td><strong>A corpus split across domains looks sparse when it is severed.</strong> Check <code>select domain, count(*) from papers group by 1</code> before blaming the extractor.</td>
+            <td>Six papers landed in <code>default</code> and one in <code>nlp</code>. All were about attention; none could relate to another, and shared concepts existed once per domain, unable to merge. This is isolation working — and invisible.</td>
+            <td><code>POST /api/papers/:id/domain</code> moves a paper and <em>rebuilds</em> its contribution: every identity decision it made was made against the wrong neighbourhood.</td></tr>
+        <tr><td><strong>31</strong></td><td><strong>Entity identity is enforced by the database.</strong> A unique index on <code>(coalesce(domain,''), normalized_name)</code> where the name is not null, and node creation is an <code>ON CONFLICT … DO UPDATE … RETURNING</code> upsert so a losing writer reads back the winner.</td>
+            <td>Resolution's lookups decide <em>which</em> node a mention belongs to and cannot prevent a race. The write path ended in a SELECT that missed followed by an INSERT — two concurrent transactions produced two nodes with the same name in one domain. Reachable in the shipped config: <code>PROCESS_CONCURRENCY</code> is a knob and the queue is multi-instance.</td>
+            <td>DB suite races eight writers at one entity: one row, and all eight receive the same id. Also asserts the constraint does <em>not</em> collapse the same name across two domains.</td></tr>
+        <tr><td><strong>32</strong></td><td><strong>One live process job per paper.</strong> Partial unique index over non-terminal, non-paused process jobs; <code>createJob</code> raises <code>AlreadyScheduledError</code>.</td>
+            <td>Two routes could schedule a paper and only <code>/resume</code> checked first. Four papers ended up with two queued jobs, one already <code>processing</code>. Both run <code>resumePaper</code>, which clears unfinished contribution before rebuilding — so with concurrency each clears what the other is writing.</td>
+            <td>A DB test bypasses the route guard and calls <code>createJob</code> directly; the database refuses. <code>paused</code> is terminal so a parked paper stays resumable.</td></tr>
+        <tr><td><strong>33</strong></td><td><strong>Progress must describe work that still exists.</strong> Every path that clears contribution resets <code>processing_progress</code> in the same statement.</td>
+            <td>A rebuild left the old percentage, so a paper holding zero chunks displayed 100%. Same class of lie as a failed paper shown as "Pending".</td>
+            <td>Reset is in the same <code>UPDATE</code> as the status change, so the two cannot drift.</td></tr>
+        <tr><td><strong>34</strong></td><td><strong>A paper's nodes cannot stay behind when it moves.</strong> A domain move removes nodes it owns in the old domain that nothing else references.</td>
+            <td><code>clearPaperContributions</code> keeps nodes on purpose — shared within a domain — and that reasoning inverts across a move. One paper in <code>nlp</code> still owned 255 nodes stamped <code>default</code>: invariant 4 broken by the operation meant to preserve it.</td>
+            <td><code>repair:domain-drift</code> audits any corpus for the disagreement; dry run unless <code>--apply</code>.</td></tr>
+        <tr><td><strong>35</strong></td><td><strong><code>type='paper'</code> is not "an ingested document".</strong> Offering a document to open additionally requires <code>p.id = n.paper_id AND lower(p.title) = n.normalized_name</code>.</td>
+            <td>The extractor creates a paper node for every cited work — seven papers produced eighty-five paper nodes, seventy-four of them citation targets with no text to study.</td>
+            <td>Only a document's own node satisfies both halves; a citation target carries the citing paper's id.</td></tr>
+        <tr><td><strong>36</strong></td><td><strong>An activity signal counts work, not rows.</strong> The dashboard's poll interval reads <code>workers.running + workers.queued</code>.</td>
+            <td>It keyed on list length until invariant 27 made that list include <code>failed</code> and <code>paused</code> papers — after which it polled every 2 s forever with nothing running. <strong>A change three files away re-created the bug the interval existed to fix.</strong></td>
+            <td>DB test: parked papers appear in the list and contribute zero to <code>workers</code>. That test is the contract the first fix lacked.</td></tr>
+        <tr><td><strong>37</strong></td><td><strong>A control that fails silently is worse than no control.</strong> Mutation errors render in the UI, not only in <code>console.error</code>.</td>
+            <td>A broken button and a slow one looked identical, leaving the operator no way to tell which they were looking at.</td>
+            <td>Errors surface in a dismissible banner beside the controls.</td></tr>
       </tbody>
     </table>
   </div>
@@ -1232,7 +1276,8 @@ hr.soft{border:none;border-top:1px solid var(--border);margin:34px 0}
     <span class="label">How to read a gap in the numbering</span>
     15, 18, 21 are missing. That is not sloppiness — invariants were <em>removed</em> when the thing they
     protected was redesigned away, and the numbers were not reused so that older commit messages and comments
-    referring to "invariant 18" do not silently point at something else. <strong>Stable identifiers for rules are
+    referring to "invariant 18" do not silently point at something else. 24–30 were added later and are appended
+    rather than interleaved, for the same reason: <strong>an invariant's number is an identifier, not a ranking.</strong> <strong>Stable identifiers for rules are
     worth more than tidy sequences.</strong> The same reasoning is why revoking a principal is a timestamp and not
     a delete (ch. 31), and why the audit log denormalises the actor label.
   </div>
@@ -1498,6 +1543,42 @@ hr.soft{border:none;border-top:1px solid var(--border);margin:34px 0}
     all."</em> A derived value that can disagree with its source is a bug waiting for a deadline. The cost is one
     <code>GROUP BY</code> per read, which the <code>jobs_batch_idx</code> index makes trivial.
   </div>
+
+  <h4 class="sub4"><code>paper_chunks</code> — the checkpoint that makes a retry cheap</h4>
+  <p>
+    One row per chunk a paper has completed, with a content hash. Extraction costs ~34&nbsp;s per chunk over ~26
+    chunks, so a failure at chunk 24 used to discard fifteen minutes of correct work — the only provably-safe
+    undo was "undo everything", because an edge could not be attributed to a chunk.
+    <code>sources.chunk_index</code> makes it attributable, so the undo can be per-chunk and the retry can resume.
+  </p>
+  <div class="note warn">
+    <span class="label">Why the hash, and why the write order</span>
+    Resume assumes chunk N still means the text it meant last time. Chunking is deterministic given the source, so
+    a hash settles it: a mismatch means the boundaries moved and every checkpoint is stale. <strong>Resuming onto
+    different content would silently mis-attribute evidence</strong> — worse than redoing the work.
+    <br/><br/>
+    The checkpoint is written <em>after</em> the chunk's rows land. A crash between the two costs a redo of that
+    chunk; recording one that did not happen would skip it forever. <strong>Losing a checkpoint is recoverable;
+    inventing one is not.</strong>
+  </div>
+
+  <h4 class="sub4"><code>graph_findings</code> — proposals, not changes</h4>
+  <p>
+    What the background audit believes about a domain: a node (and for a merge, the node that should survive), a
+    detector name, a verdict, a <em>reason in the operator's terms</em>, and a confidence. The audit writes here
+    and changes nothing else.
+  </p>
+  <div class="cols-2">
+    <div class="card"><div class="card-head"><span class="card-title">Why <code>reason</code> is a column</span></div>
+      <div class="card-body"><p>A proposal nobody can evaluate is noise. "Distinguished by <em>ensemble</em>" is actionable; a confidence score alone is not. The reason is what makes a human able to overrule the tool, which is the point of storing rather than applying.</p></div></div>
+    <div class="card"><div class="card-head"><span class="card-title">Why <code>dismissed</code> rows are kept</span></div>
+      <div class="card-body"><p>Without them the next audit re-proposes what a human already rejected. A tool that keeps asking the same question gets ignored — which is how a quality system stops working without anyone deciding to switch it off. Same reasoning as revoking a principal by timestamp rather than by delete.</p></div></div>
+  </div>
+  <p>
+    Proposals for a domain are replaced on each run rather than accumulated: a finding is a statement about the
+    graph <em>as it is now</em>, and a stale one would have an operator applying a merge whose target was rebuilt
+    an hour ago.
+  </p>
 
   <h4 class="sub4"><code>principals</code> / <code>audit_log</code> — identity with an afterlife</h4>
   <p>
@@ -1766,6 +1847,62 @@ hr.soft{border:none;border-top:1px solid var(--border);margin:34px 0}
     depended on the engine's sort internals, and communities changed shape for reasons entirely unrelated to the
     graph. If a result depends on randomness, the randomness has to be <em>correct</em> randomness, or the
     result is not reproducible and cannot be debugged.
+  </div>
+
+  <h3 class="sub">The migrations, and what each one was written to prevent</h3>
+  <p>
+    Schema changes ship as versioned migrations, never <code>db:push</code>, on anything holding data
+    (invariant 14). Read as a sequence they are a fair record of what this system got wrong and when.
+  </p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th style="width:250px">Migration</th><th>What it exists for</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">0000_add_pgvector_indexes</td><td>HNSW on node and proposition vectors — the change that took retrieval from 21&nbsp;s to 153&nbsp;ms.</td></tr>
+        <tr><td class="mono">0001_drop_jsonb_embeddings</td><td>Storing vectors twice was a <em>latency</em> bug: 1.8× p50 from cache eviction. <strong>Guards itself</strong> — refuses to drop the column unless its replacement is populated.</td></tr>
+        <tr><td class="mono">0002_propositions_text_search</td><td>GIN index for the lexical signal, worth 37 points of hub nDCG.</td></tr>
+        <tr><td class="mono">0003_identity_and_audit</td><td>Tenants, principals, keys, audit log.</td></tr>
+        <tr><td class="mono">0004_connector_documents</td><td><code>connector</code> and <code>structured_units</code>: one substrate, many sources.</td></tr>
+        <tr><td class="mono">0005_batches_and_durable_queue</td><td><code>batches</code>, <code>jobs.attempts</code>, <code>jobs.batch_id</code> — the queue becomes the table.</td></tr>
+        <tr><td class="mono">0006_separate_failures_from_claims</td><td><code>jobs.failures</code>, because an interruption was spending the retry budget meant for real errors. <strong>Also repairs the damage</strong>: re-queues jobs failed by that accounting, since a schema change that leaves destroyed work destroyed is half a fix.</td></tr>
+        <tr><td class="mono">0007_chunk_checkpoints</td><td><code>paper_chunks</code>, <code>sources.chunk_index</code>, and the <code>paused</code> statuses. Retries resume instead of restarting.</td></tr>
+        <tr><td class="mono">0008_node_identity_unique</td><td>The unique identity index — and it merges pre-existing duplicates first, repointing edges, provenance, propositions and vectors, and deleting the self-edges the merge creates.</td></tr>
+        <tr><td class="mono">0009_one_active_job_per_paper</td><td>Partial unique index; collapses existing duplicates, preferring a claimed job over an unclaimed one because it may be mid-extraction.</td></tr>
+        <tr><td class="mono">0010_graph_findings</td><td>The audit's proposals table.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="note vio">
+    <span class="label">A pattern worth stealing: migrations that repair, not just alter</span>
+    <code>0006</code>, <code>0008</code> and <code>0009</code> all do two jobs — add the constraint <em>and</em>
+    fix the rows that violate it. A constraint cannot be added to a table that already breaks it, so the repair
+    is not optional; the choice is whether it happens in the migration where the reasoning is written down, or in
+    a hurried manual query at 2&nbsp;am. <strong>The migration is the only place the intent and the fix stay
+    together.</strong>
+  </div>
+
+  <h3 class="sub">Operational commands</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th style="width:250px">Command</th><th>What it answers or repairs</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">pnpm --filter api eval</td><td>Retrieval quality. Run before <em>and</em> after any change to PPR, MMR, fusion, seeds or hops (invariant 23).</td></tr>
+        <tr><td class="mono">pnpm --filter api models:compare</td><td>Per-role model trade-offs on this hardware (invariant 22).</td></tr>
+        <tr><td class="mono">pnpm --filter api bench:retrieval</td><td>Latency A/B against the pre-index path.</td></tr>
+        <tr><td class="mono">pnpm --filter api bench:lane-width</td><td><strong>Should <code>PROCESS_CONCURRENCY</code> be higher?</strong> Alternates arm order so a drifting machine cannot fake a result, refuses to run while a live lease holds the GPU, and calls a result inconclusive when it is smaller than the run-to-run spread.</td></tr>
+        <tr><td class="mono">pnpm --filter api seed:load</td><td>Synthetic corpus. Clears its own prior fixture — it used to be additive, which produced 100,000 rows over 50,000 names and a corpus the system could not legally hold.</td></tr>
+        <tr><td class="mono">pnpm --filter api backfill:mentions</td><td>Attach entities to the paper that named them, for corpora ingested before that was automatic. Dry run by default.</td></tr>
+        <tr><td class="mono">pnpm --filter api repair:domain-drift</td><td>Find and fix nodes whose domain disagrees with their paper's. Dry run by default.</td></tr>
+        <tr><td class="mono">POST /api/graph/audit</td><td>Queue the quality audit (ch. 17c). Writes proposals; changes nothing.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="note good">
+    <span class="label">Every repair tool is a dry run until told otherwise</span>
+    <code>backfill:mentions</code> writes 420 rows on a corpus this size; <code>repair:domain-drift</code> deleted
+    535 nodes on its first real invocation. A tool that does that on first run — before its operator has seen what
+    it intends — is a trap, however correct its logic. Reporting first is not politeness; it is the only way the
+    operator can catch the case the tool's author did not think of.
   </div>
 
   <h3 class="sub">Putting the six together</h3>
@@ -2539,95 +2676,225 @@ edges: <span class="hv">exposes 4</span> · <span class="hv">belongs_to 4</span>
     pipeline that costs one embedding call per chunk and one that costs two.
   </p>
 
-  <h3 class="sub">Threshold 0.82: what it means and how to move it</h3>
-  <div class="cols-2">
-    <div class="card"><div class="card-head"><span class="card-title">Too low</span><span class="card-tag">over-merge</span></div>
-      <div class="card-body"><p>"attention mechanism" and "self-attention" collapse into one node. The graph looks cleaner and is <strong>wrong</strong>. Irreversible: once merged, nothing records that they were ever distinct.</p></div></div>
-    <div class="card"><div class="card-head"><span class="card-title">Too high</span><span class="card-tag">fragment</span></div>
-      <div class="card-body"><p>"3DGS" and "3D Gaussian Splatting" stay separate. Multi-hop traversal breaks at the seam, PPR mass splits, and the answer to "what improves 3DGS" misses half the literature.</p></div></div>
+  <h3 class="sub">Threshold 0.82: audited, and found insufficient on its own</h3>
+  <p>
+    The threshold was chosen by reasoning, never measured. When it finally <em>was</em> measured — by running
+    every same-type pair in the live graph through the comparison that resolution uses — the result inverted the
+    design. Every single pair above 0.82 was a pair of genuinely <strong>different</strong> things:
+  </p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th style="width:90px">cosine</th><th>Pair</th><th style="width:230px">Why they are not the same</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">0.917</td><td><code>GNMT + RL [38]</code> vs <code>GNMT + RL Ensemble [38]</code></td><td>A model and its ensemble</td></tr>
+        <tr><td class="mono">0.913</td><td><code>Deep-Att + PosUnk Ensemble [39]</code> vs <code>Deep-Att + PosUnk [39]</code></td><td>Same, reversed</td></tr>
+        <tr><td class="mono">0.904</td><td><code>WMT 2014 English-to-German</code> vs <code>WMT 2014 English-to-French</code></td><td>Two different tasks</td></tr>
+        <tr><td class="mono">0.888</td><td><code>recurrent neural networks</code> vs <code>gated recurrent neural networks</code></td><td>A qualifier that changes the architecture</td></tr>
+        <tr><td class="mono">0.870</td><td><em>Convolutional Sequence to Sequence Learning</em> vs <em>Sequence to Sequence Learning…</em></td><td>Two different papers</td></tr>
+        <tr><td class="mono">0.833</td><td><em>Neural Machine Translation by Jointly Learning…</em> vs <em>Effective Approaches…</em></td><td>Two different papers</td></tr>
+        <tr><td class="mono">0.839</td><td><code>averaging the last 20 checkpoints</code> vs <code>…the last 5 checkpoints</code></td><td>Different numbers, different claims</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="note bad">
+    <span class="label">The finding that killed the threshold-only design</span>
+    Two distinct papers score <strong>0.87</strong>. Two distinct language pairs score <strong>0.90</strong>.
+    There is no value of the threshold that separates these from genuine synonyms, because
+    <strong>the embedding measures topic and identity is not topic</strong>. Raising the bar to 0.93 would keep
+    these apart and would also refuse <code>3DGS</code> ↔ <code>3D&nbsp;Gaussian&nbsp;Splatting</code>, which is
+    the entire reason the embedding path exists. A single scalar cannot carry this decision.
+  </div>
+
+  <h3 class="sub">The merge guard: cosine gets a vote, not a veto</h3>
+  <p>
+    <code>knowledge-field/merge-guard.ts</code> must approve every embedding-based merge, on both the
+    graph-lookup path and the intra-batch path. It is a set of small, precise rules that replace one blunt number.
+  </p>
+  <pre><span class="c">// merge-guard.ts — the four rules, in the order they fire</span>
+<span class="k">export function</span> <span class="f">mayMerge</span>(a, b): MergeVerdict {
+  <span class="c">// 1. A paper's identity is its title, not its subject.</span>
+  <span class="k">if</span> (IDENTITY_BY_NAME_ONLY.<span class="f">has</span>(typeA) || IDENTITY_BY_NAME_ONLY.<span class="f">has</span>(typeB))
+    <span class="k">return</span> { ok: <span class="k">false</span>, reason: <span class="s">'papers are identified by title, not by topical similarity'</span> };
+
+  <span class="c">// 2. Numbers must match exactly: "last 20" and "last 5" are different claims.</span>
+  <span class="k">if</span> (<span class="f">numbers</span>(tokensA).<span class="f">join</span>() !== <span class="f">numbers</span>(tokensB).<span class="f">join</span>())
+    <span class="k">return</span> { ok: <span class="k">false</span>, reason: <span class="s">`different numbers (…)`</span> };
+
+  <span class="c">// 3. The abbreviation case — the reason embeddings are here at all.</span>
+  <span class="k">if</span> (<span class="f">isInitialism</span>(a.name, tokensB) || <span class="f">isInitialism</span>(b.name, tokensA)) <span class="k">return</span> { ok: <span class="k">true</span> };
+
+  <span class="c">// 4. Whatever they do NOT share must be generic, not distinguishing.</span>
+  <span class="k">const</span> distinguishing = [...onlyA, ...onlyB].<span class="f">filter</span>(t =&gt; !GENERIC_TOKENS.<span class="f">has</span>(t));
+  <span class="k">if</span> (distinguishing.length &gt; 0)
+    <span class="k">return</span> { ok: <span class="k">false</span>, reason: <span class="s">`distinguished by "ensemble"`</span> };
+  <span class="k">return</span> { ok: <span class="k">true</span> };
+}</pre>
+  <p>
+    Rule 4 is the interesting one. <code>Helios</code> and <code>Helios system</code> differ by a category word
+    and are one thing; <code>GNMT + RL</code> and <code>GNMT + RL Ensemble</code> differ by a technical qualifier
+    and are two. <code>GENERIC_TOKENS</code> is deliberately short — every addition widens what may merge, and the
+    cost of a wrong entry is a silent, permanent conflation.
+  </p>
+  <div class="note good">
+    <span class="label">Verified against the live graph, not against intuition</span>
+    All <strong>7</strong> above-threshold pairs in the corpus are refused, each with a logged reason
+    (<code>distinguished by "ensemble"</code>, <code>different numbers (20 vs 5)</code>, <code>papers are
+    identified by title…</code>). The merges the system exists to make still happen: <code>3DGS</code> ↔
+    <code>3D Gaussian Splatting</code>, <code>PPR</code> ↔ <code>personalized page rank</code>,
+    <code>residual connection</code> ↔ <code>residual connection technique</code>. Twenty-six unit tests pin both
+    directions using the real observed names, and retrieval quality is unchanged (nDCG 87.7%).
   </div>
   <div class="note warn">
-    <span class="label">The asymmetry that should decide the default</span>
-    Fragmentation is <em>recoverable</em> — a later merge tool, or a bridge edge, can fix it, and the evidence
-    survives on both nodes. Over-merging is <strong>not</strong>: the provenance of both entities is now attached
-    to one node and there is no record of the split. So the threshold should err high, and 0.82 is a defensible
-    high-ish value for cosine on modern sentence embeddings.
-    <br/><br/>
-    <strong>But it has never been swept against a labelled set.</strong> That is the honest state. It is a
-    hardcoded constant with a reasoned-about value and no measurement behind it — exactly the kind of thing that
-    invariant 23 exists to prevent elsewhere in the system, and it has not been applied here. Chapter 51.
+    <span class="label">The asymmetry is the whole argument</span>
+    A false <em>split</em> leaves two nodes that anyone can see and merge later; the evidence survives on both.
+    A false <em>merge</em> destroys the distinction permanently and invisibly — nothing downstream can recover
+    that two things were ever different. So the guard refuses unless it can state a reason to proceed, and
+    <code>RESOLUTION_MERGE=exact</code> disables embedding merges entirely for deployments that want zero risk.
+    <code>vector</code> restores the audited-unsafe behaviour and exists only to reproduce the audit above.
   </div>
 
-  <h3 class="sub">The cross-type rule, and a real bug in it</h3>
-  <pre><span class="c">// resolve-embed.ts — the type gate before an embedding comparison</span>
-<span class="k">const</span> nodeType = <span class="f">normalizeType</span>(n.type);
+  <h3 class="sub">The cross-type rule, and the dead code that hid inside it</h3>
+  <pre><span class="c">// The old gate. The inner `if` is unreachable — the outer one already proved it.</span>
 <span class="k">if</span> (nodeType !== cand.type &amp;&amp; cand.type !== <span class="s">'paper'</span> &amp;&amp; nodeType !== <span class="s">'paper'</span>) {
-  <span class="c">// allow cross-type only when one side is a paper; otherwise require same type</span>
-  <span class="k">if</span> (nodeType !== cand.type) <span class="k">continue</span>;
+  <span class="k">if</span> (nodeType !== cand.type) <span class="k">continue</span>;   <span class="c">// ← always true: dead condition</span>
 }</pre>
-  <p>
-    The intent is sound: a <code>dataset</code> named "COCO" and a <code>method</code> named "COCO" are different
-    things and must not merge on embedding proximity, but a <code>paper</code> node and a
-    <code>paper_reference</code> mention are the same thing under two names. Type equality is a cheap, strong
-    prior that prevents a whole class of over-merge.
-  </p>
   <div class="note bad">
-    <span class="label">Open defect · the inner condition is dead code</span>
-    Look carefully. The outer <code>if</code> already established <code>nodeType !== cand.type</code>, so the inner
-    <code>if (nodeType !== cand.type)</code> is always true — the nested check does nothing, and the block reduces
-    to <code>continue</code>. The effect is that <em>when one side is a paper, the loop falls through and compares
-    anyway</em>, which happens to match the stated intent. The behaviour is right by accident.
+    <span class="label">War story · a correct outcome reached by incorrect code</span>
+    The outer <code>if</code> had already established <code>nodeType !== cand.type</code>, so the inner check did
+    nothing and the block reduced to <code>continue</code>. The behaviour happened to match the stated intent —
+    which is the most dangerous kind of defect, because tests pass and nobody looks again. The next person to
+    "simplify" it had a coin-flip chance of inverting the semantics.
     <br/><br/>
-    This is worth including precisely because it is <strong>a correct outcome reached by incorrect code</strong> —
-    the most dangerous kind of defect, because tests pass and nobody looks again. The next person who refactors
-    this "simplification" has a coin-flip chance of inverting the semantics. Tracked in chapter 67.
+    <strong>Resolved, and the rule it encoded was then reversed by the audit.</strong> The old intent was that a
+    <code>paper</code> could match across types on proximity, because the extractor names papers both as entities
+    and as citation targets. Measurement says otherwise: two genuinely different papers score 0.87, so proximity
+    cannot decide <em>which</em> paper something is. Papers now merge on an exact title match and nothing else —
+    and an exact title still resolves, because that path never goes through the embedding comparison at all.
   </div>
 
-  <h3 class="sub">The candidate window: a bound that had to become visible</h3>
-  <pre><span class="c">// pipeline/processor.ts</span>
-<span class="k">const</span> existingNodes = <span class="k">await</span> db.<span class="f">select</span>().<span class="f">from</span>(nodes)
-  .<span class="f">where</span>(<span class="f">domainWhere</span>(nodes.domain, domain.id))
-  .<span class="f">orderBy</span>(<span class="f">desc</span>(nodes.createdAt), <span class="f">desc</span>(nodes.id))   <span class="c">// ← deterministic</span>
-  .<span class="f">limit</span>(RESOLUTION_CANDIDATE_LIMIT);                <span class="c">// default 2000</span>
-
-<span class="k">if</span> (existingNodes.length === RESOLUTION_CANDIDATE_LIMIT &amp;&amp; !candidateCapWarned) {
-  <span class="f">console</span>.<span class="f">warn</span>(<span class="s">`[processor] domain "${domain.id}" has at least ${LIMIT} nodes; entity resolution only `</span> +
-               <span class="s">`compares against the ${LIMIT} most recent. Older entities may be duplicated.`</span>);
-}</pre>
+  <h3 class="sub">The candidate window, and why it had to die <span class="chip ok">built</span></h3>
+  <p>
+    Resolution used to load the <code>RESOLUTION_CANDIDATE_LIMIT</code> (2,000) most recently created in-domain
+    nodes and compare every mention against every one of them in JavaScript. Two separate defects lived there.
+  </p>
   <div class="note bad">
     <span class="label">War story · the silent duplication engine</span>
-    This used to be <code>.limit(500)</code> <strong>with no <code>ORDER BY</code></strong>. Once a domain passed
-    500 nodes, Postgres returned an <em>arbitrary</em> subset — different on every call, at the planner's
-    discretion — and every mention outside that subset silently became a duplicate entity.
+    The first version was <code>.limit(500)</code> <strong>with no <code>ORDER BY</code></strong>. Past 500 nodes
+    Postgres returned an <em>arbitrary</em> subset — different on every call, at the planner's discretion — and
+    every mention outside it silently became a duplicate. Any <code>LIMIT</code> without an <code>ORDER BY</code>
+    is a non-deterministic result set masquerading as a bounded one.
     <br/><br/>
-    The graph did not report an error. It just quietly grew two nodes for "3D Gaussian Splatting", then three,
-    then five, splitting PPR mass and evidence across all of them. The damage compounded with corpus size and
-    was invisible until someone looked at the node list by hand.
-    <br/><br/>
-    <strong>The fix has three parts and all three matter:</strong> the window is <em>deterministic</em> (ordered),
-    <em>configurable</em> (<code>RESOLUTION_CANDIDATE_LIMIT</code>), and <em>observable</em> (it logs when it hits
-    the cap). Any <code>LIMIT</code> without an <code>ORDER BY</code> is a non-deterministic result set
-    masquerading as a bounded one — that is a general SQL rule, not a Manifold one.
+    Ordering made it deterministic, which made it <em>predictably</em> wrong rather than randomly wrong. Past
+    2,000 nodes, identity depended on creation order: an entity introduced by paper #1 was invisible to paper #40,
+    so the graph forked an entity it already contained — and logged
+    <code>"Older entities may be duplicated"</code> while carrying on.
+  </div>
+  <p>
+    The window is gone. Candidates now come from <code>knowledge-field/resolve-candidates.ts</code>: two bounded,
+    domain-scoped index reads whose cost is proportional to the number of <em>mentions</em>, not to the size of
+    the graph.
+  </p>
+  <pre><span class="c">// One batched k-NN query answers every mention in one round trip.</span>
+<span class="k">with</span> mentions(idx, vec, mtype) <span class="k">as</span> (<span class="k">values</span> (0, <span class="s">'[…]'</span>::vector, <span class="s">'method'</span>), …)
+<span class="k">select</span> m.idx, c.id, c.name, c.type, c.distance
+<span class="k">from</span> mentions m
+<span class="k">cross join lateral</span> (
+  <span class="k">select</span> n.id, n.name, n.type, (nv.embedding_vec &lt;=&gt; m.vec) <span class="k">as</span> distance
+  <span class="k">from</span> node_vectors nv <span class="k">join</span> nodes n <span class="k">on</span> n.id = nv.node_id
+  <span class="k">where</span> nv.embedding_vec <span class="k">is not null</span>
+    <span class="k">and</span> n.domain = $domain                       <span class="c">-- isolation, inside the scan</span>
+    <span class="k">and</span> (<span class="f">lower</span>(n.type) = m.mtype <span class="k">or</span> …)          <span class="c">-- the type rule, pushed down</span>
+  <span class="k">order by</span> nv.embedding_vec &lt;=&gt; m.vec
+  <span class="k">limit</span> 8
+) c</pre>
+  <div class="cols-2">
+    <div class="card"><div class="card-head"><span class="card-title">Exact name</span><span class="card-tag">btree</span></div>
+      <div class="card-body"><p>One batched equality probe on <code>nodes_normalized_name_idx</code>, whole domain, no window. The old path used <code>ilike</code> — measured on 100k nodes it was a <strong>Seq Scan discarding all 100,000 rows at plan cost 3039</strong>, against an index scan at cost 12, for a question it was already semantically equivalent to since both sides are pre-lowercased.</p></div></div>
+    <div class="card"><div class="card-head"><span class="card-title">Nearest neighbours</span><span class="card-tag">HNSW</span></div>
+      <div class="card-body"><p>A lateral join over <code>node_vectors_embedding_hnsw</code>, so N mentions cost one round trip and each gets its own index search rather than sharing a trimmed result set.</p></div></div>
+  </div>
+  <div class="note warn">
+    <span class="label">The plan is worth reading honestly</span>
+    <code>EXPLAIN</code> confirms <code>Index Scan using node_vectors_embedding_hnsw</code> per outer row — but it
+    also shows the domain and type filters applied <em>above</em> the index scan, as the executor discards rows
+    that arrive. With <code>hnsw.iterative_scan</code> off, that walk stops after <code>ef_search</code>
+    candidates whether or not K of them passed, so a domain holding a small slice of the corpus can come back with
+    fewer than K eligible neighbours — or none. In retrieval that is a quality wobble; here it would mean minting
+    a duplicate entity, which is permanent. The query therefore asks for <code>strict_order</code> iterative scan,
+    with a capability probe and a loud fallback for pgvector &lt; 0.8. Measured on 100k nodes it was not needed —
+    a 20-node minority domain returned 8 of 8 either way — but <em>"it happened to work on this corpus"</em> is
+    not a property.
+  </div>
+  <div class="note good">
+    <span class="label">Proven by a test that seeds more than the old window</span>
+    The regression suite inserts <strong>2,500</strong> nodes — more than the limit that used to exist — buries a
+    decade-old entity underneath them, and demands it still resolve, in-domain only. Any reintroduced window fails
+    it. A second test gives 200 of the filler nodes vectors so the k-NN query has a real field to discriminate
+    within, rather than one candidate it cannot help but return.
   </div>
 
-  <h3 class="sub">The real fix, not yet built</h3>
+  <h3 class="sub">The layer none of the above provides: concurrency <span class="chip ok">built</span></h3>
   <p>
-    Resolution still compares in JavaScript against at most 2,000 recent in-domain nodes, which is
-    <strong>O(mentions × candidates)</strong> per chunk and misses anything older than the window. The vectors are
-    already in an HNSW index that answers exactly this question:
+    Everything so far decides <em>which</em> node a mention belongs to. None of it prevents two workers from
+    creating the same node at the same time, because the write path ended in a check-then-insert:
   </p>
-  <pre><span class="c">// The move: one ANN query per mention instead of a 2000-row scan in JS</span>
-SELECT n.id, n.name, n.type, 1 - (nv.embedding_vec &lt;=&gt; $mention) AS sim
-FROM node_vectors nv JOIN nodes n ON n.id = nv.node_id
-WHERE n.domain = $domain AND n.type = $type
-ORDER BY nv.embedding_vec &lt;=&gt; $mention
-LIMIT 5;</pre>
+  <pre><span class="c">-- Two workers, two different papers, both mentioning "Transformer"</span>
+<span class="k">select</span> id <span class="k">from</span> nodes <span class="k">where</span> normalized_name = $1 <span class="k">and</span> domain = $2;  <span class="c">-- both miss</span>
+<span class="k">insert into</span> nodes …;                                              <span class="c">-- both create</span></pre>
+  <div class="note bad">
+    <span class="label">Demonstrated, not hypothesised</span>
+    Two concurrent transactions with a 0.4&nbsp;s pause between the check and the insert produced
+    <strong>two nodes with the same <code>normalized_name</code> in the same domain</strong>. This is reachable in
+    the shipped configuration: <code>PROCESS_CONCURRENCY</code> is a knob, and the queue is deliberately
+    multi-instance, so two papers extracting in parallel is the design working as intended.
+  </div>
   <p>
-    That is the ANN-blocking pattern from record-linkage literature: use an index to fetch a handful of plausible
-    candidates, then compare only those. It removes the window entirely, makes resolution independent of corpus
-    size, and reuses infrastructure that already exists for retrieval. <strong>It is the highest-value unbuilt
-    change in the write path</strong>, and it is listed as a known gap rather than pretended away.
+    Only the database can serialise this, so it does. Migration <code>0008</code> merges any pre-existing
+    duplicates — repointing edges, provenance, propositions and vectors, deleting self-edges the merge creates —
+    and then adds the constraint:
   </p>
+  <pre><span class="k">create unique index</span> nodes_identity_unique
+  <span class="k">on</span> nodes ((<span class="f">coalesce</span>(domain, <span class="s">''</span>)), normalized_name)
+  <span class="k">where</span> normalized_name <span class="k">is not null</span>;</pre>
+  <p>
+    Node creation became an upsert, so the loser of the race reads back the winner and carries on attaching its
+    edges rather than failing the chunk. <code>coalesce</code> because NULL domains do not conflict with each
+    other in Postgres — including them would silently weaken the constraint rather than widen it. Partial, because
+    a node without a normalized name has no identity to compare.
+  </p>
+  <div class="note good">
+    <span class="label">Eight concurrent writers, one node, eight identical ids</span>
+    The DB suite races eight writers at the same entity and asserts both properties that matter: one row exists,
+    and <em>every</em> writer came away with the same id. It also asserts the two things the constraint must
+    <strong>not</strong> do — collapse the same name across two domains (isolation is not deduplication), or
+    collapse two genuinely different names.
+  </div>
+  <div class="note vio">
+    <span class="label">A fixture that could not exist in production was measuring production</span>
+    The constraint would not build on the 100k load corpus: <strong>50,000 duplicate groups</strong>. The seeder
+    was additive and restarted its counter each run, so two invocations produced 100,000 rows over 50,000 distinct
+    names. The latency figures stand — HNSW indexes 100,000 distinct vectors either way — but the corpus did not
+    describe what it claimed to, and it was not a corpus the system could ever hold. <code>seed:load</code> now
+    clears its own prior fixture first.
+  </div>
+
+  <h3 class="sub">The other half of the same defect: one chunk naming a thing twice</h3>
+  <p>
+    Fixing cross-document fragmentation left the intra-batch case untouched, and a live run exposed it
+    immediately: a single chunk named <code>Helios</code> and <code>Helios system</code>, neither existed yet, so
+    no lookup could relate them — <strong>two nodes for one thing, in one document</strong>. Mentions that are new
+    to the graph are now compared against each other before identities are minted, under the same threshold, the
+    same type rule and the same merge guard. First occurrence wins the canonical name: deterministic, and the
+    first mention of a thing is usually the definitional one.
+  </p>
+  <div class="note good">
+    <span class="label">Verified end to end</span>
+    Two nodes before, one after, with the real embedder (<code>nomic-embed-text</code> scores that pair 0.881).
+    The unit tests deliberately use lexically-near pairs — <code>adaptive batching</code> /
+    <code>adaptive batching method</code>, 0.87 under the deterministic local embedder — rather than semantically
+    near ones, because they test the collapse mechanism, not the embedder's judgement. The embedder is a
+    swappable deployment choice; this logic is not.
+  </div>
 
   <h3 class="sub">Where <code>legacy</code> mode fits</h3>
   <p>
@@ -2854,6 +3121,50 @@ LIMIT 5;</pre>
       </div>
     </div>
   </div>
+  <h3 class="sub">From whole-paper undo to per-chunk undo <span class="chip ok">built</span></h3>
+  <p>
+    Clearing everything is <em>correct</em>, and it was also the only provably-safe option while an edge could
+    not be attributed to a chunk. The cost was severe: extraction runs ~34&nbsp;s per chunk over ~26 chunks, so a
+    failure at chunk 24 discarded <strong>fifteen minutes of correct GPU work</strong> and began again at chunk 0.
+    Retries are common — a deploy, a crash, a transient model error — so this was paid often.
+  </p>
+  <p>
+    <code>sources.chunk_index</code> makes every claim attributable and <code>paper_chunks</code> records what
+    completed, with a content hash. Idempotency then holds at a finer grain: the chunks about to run have their
+    previous claims cleared first, exactly as a full re-run does for the whole paper, while completed chunks keep
+    theirs.
+  </p>
+  <div class="cols-2">
+    <div class="card"><div class="card-head"><span class="card-title"><code>resumePaper</code></span><span class="card-tag">default</span></div>
+      <div class="card-body"><p>Keeps every chunk that completed against unchanged text, clears and redoes the rest. What a retry, a resume and a restart all call.</p></div></div>
+    <div class="card"><div class="card-head"><span class="card-title"><code>reprocessPaper</code></span><span class="card-tag">?rebuild=true</span></div>
+      <div class="card-body"><p>Clear everything, start at chunk 0. The right call when the goal is genuinely to rebuild — a changed extractor, a new model, a corrected document — and never what a crash silently triggers.</p></div></div>
+  </div>
+  <div class="note warn">
+    <span class="label">The content hash is the guard that makes resume sound</span>
+    Resume assumes chunk N still means the text it meant last time. Chunking is deterministic given the source, so
+    a hash settles it: matching means the checkpoint describes this exact text, mismatching means the boundaries
+    moved and every checkpoint is stale. <strong>Resuming onto different content would silently mis-attribute
+    evidence</strong> — worse than redoing the work — so stale checkpoints are discarded, loudly.
+    <br/><br/>
+    The checkpoint is written <em>after</em> the chunk's rows land, never before. A crash between the two costs a
+    redo of that chunk; recording a checkpoint that did not happen would skip it forever.
+  </div>
+  <div class="note good">
+    <span class="label">Proven live</span>
+    Ran a paper, killed the process, dropped one checkpoint, called resume. The processor logged
+    <code>resuming: 1/2 chunk(s) already extracted, skipping them</code>, ran only chunk 2, and produced
+    <strong>zero</strong> duplicated edges. Nine DB tests pin the rest, including the two properties most likely
+    to rot silently: an edge another kept chunk still asserts survives, and rows written before
+    <code>chunk_index</code> existed (null attribution) are redone rather than guessed at.
+  </div>
+  <div class="note bad">
+    <span class="label">Honest limit</span>
+    Propositions carry no chunk attribution, so a partial resume keeps the ones from completed chunks rather than
+    rewriting them. Correct today, but it means proposition-level dedup leans entirely on the chunk-level undo
+    being right.
+  </div>
+
   <p>
     <code>reprocessPaper()</code> composes it: clear, reset status to <code>pending</code>, then
     <code>processPaper()</code>. The route decides which to call by checking
@@ -3062,29 +3373,143 @@ returning id</pre>
     Two steps that both use the GPU belong in one lane; two steps that use the GPU and the network belong in two.
   </div>
 
-  <h3 class="sub">Retries, and the discipline around them</h3>
+  <h3 class="sub">Retries: two counters, because there are two questions</h3>
   <pre><span class="k">try</span> {
   <span class="k">await</span> <span class="f">handler</span>(job);
 } <span class="k">catch</span> (err) {
   <span class="k">const</span> permanent = err <span class="k">instanceof</span> PermanentJobError;
-  <span class="k">if</span> (permanent || job.attempts &gt;= MAX_JOB_ATTEMPTS) {
+
+  <span class="c">// The handler ran and threw. THAT is evidence about the work, so it counts.</span>
+  <span class="k">const</span> [row] = <span class="k">await</span> db.<span class="f">update</span>(jobs)
+    .<span class="f">set</span>({ failures: sql<span class="s">`${jobs.failures} + 1`</span> })
+    .<span class="f">where</span>(<span class="f">eq</span>(jobs.id, job.id)).<span class="f">returning</span>({ failures: jobs.failures });
+
+  <span class="k">if</span> (permanent || row.failures &gt;= MAX_JOB_ATTEMPTS) {
     <span class="k">await</span> <span class="f">setJobStatus</span>(job.id, { status: <span class="s">'failed'</span>, error: <span class="s">/* … */</span> });
   } <span class="k">else</span> {
     <span class="k">await</span> <span class="f">requeueJob</span>(job.id, message);      <span class="c">// owner → NULL. Anyone may take it.</span>
   }
 }</pre>
-  <p>
-    <code>attempts</code> is incremented <strong>by the claim</strong>, not by the failure. That is the correct
-    place: a job that is claimed and then killed by <code>SIGKILL</code> never reaches a <code>catch</code> block,
-    and if the counter lived there, such a job would be re-queued forever. <em>Count what happened to the job,
-    not what the code managed to observe.</em>
-  </p>
+  <div class="note bad">
+    <span class="label">War story · the retry budget that a deploy could spend</span>
+    The original design used one counter. <code>attempts</code> was incremented <strong>by the claim</strong>, and
+    the reasoning for that was genuinely sound: a job claimed and then <code>SIGKILL</code>ed never reaches a
+    <code>catch</code> block, so a counter that lived there would let such a job be re-queued forever. <em>Count
+    what happened to the job, not what the code managed to observe.</em>
+    <br/><br/>
+    That reasoning is correct and it still produced a bug, because the same counter also gated the give-up
+    decision. An interruption therefore spent the budget meant for real errors. In development, <code>tsx
+    watch</code> reloads the process on every file save — three saves during a fifteen-minute extraction and two
+    papers were <strong>permanently marked failed having never once thrown</strong>. The recorded reason admitted
+    it: <code>"Interrupted and out of retry attempts (3)"</code>, with no handler error stored anywhere.
+    <br/><br/>
+    In production the trigger is the same with a different name: three deploys during a long batch.
+  </div>
+  <div class="cols-2">
+    <div class="card"><div class="card-head"><span class="card-title"><code>failures</code></span><span class="card-tag">MAX_JOB_ATTEMPTS = 3</span></div>
+      <div class="card-body"><p>Handler errors only — evidence that the <em>work</em> is bad. This is what the give-up decision reads.</p></div></div>
+    <div class="card"><div class="card-head"><span class="card-title"><code>attempts</code></span><span class="card-tag">MAX_JOB_CLAIMS = 25</span></div>
+      <div class="card-body"><p>Claims, including interruptions. A crash-loop backstop for a job that kills its worker every time — the role the single counter was accidentally serving, and serving badly, because it could not tell a poisoned job from an unlucky one.</p></div></div>
+  </div>
+  <div class="note vio">
+    <span class="label">The generalisable rule</span>
+    <strong>Never gate a give-up decision on a counter that a deploy increments.</strong> An interruption is
+    evidence about the <em>process</em>, not about the work. Migration <code>0006</code> both adds the column and
+    repairs the damage: it finds jobs failed with that exact message and returns them to the queue, because a
+    schema change that leaves destroyed work destroyed is only half a fix.
+  </div>
   <p>
     Note also the third re-queue path: <strong>a job whose <code>type</code> has no registered handler is
     re-queued, not failed.</strong> During a rolling deploy an old instance may claim a job type only the new
     build knows how to run — <em>"a row we cannot run must not be swallowed into limbo."</em> It is released
     leaseless so the reaper collects it if nobody ever can.
   </p>
+
+  <h3 class="sub">One live job per paper, and why the route check was not enough</h3>
+  <p>
+    Two routes could schedule a paper for processing. <code>POST /:id/resume</code> looked for an existing
+    non-terminal job first; <code>POST /:id/domain</code> did not. That asymmetry is the same shape of bug the
+    authorization chokepoint exists to prevent elsewhere — <strong>a rule held by remembering to check it, in one
+    of the two places that needed it.</strong>
+  </p>
+  <div class="note bad">
+    <span class="label">Observed live, on the operator's dashboard</span>
+    Four papers with two queued process jobs each, and one with a job already <code>processing</code> while
+    another sat queued behind it. The visible symptom was mild — a paper would simply be extracted twice — but the
+    real cost is not the wasted fifteen minutes. Both jobs run <code>resumePaper</code>, which
+    <em>clears the paper's unfinished contribution before rebuilding it</em>. With
+    <code>PROCESS_CONCURRENCY &gt; 1</code> or a second instance, the two overlap and each clears work the other
+    is writing.
+  </div>
+  <pre><span class="k">create unique index</span> jobs_one_active_per_paper
+  <span class="k">on</span> jobs (paper_id)
+  <span class="k">where</span> type = <span class="s">'process'</span>
+    <span class="k">and</span> paper_id <span class="k">is not null</span>
+    <span class="k">and</span> status <span class="k">not in</span> (<span class="s">'completed'</span>, <span class="s">'failed'</span>, <span class="s">'paused'</span>);</pre>
+  <p>
+    <code>createJob</code> translates the violation into a typed <code>AlreadyScheduledError</code>, so both
+    routes report "already scheduled" rather than crashing, and <strong>a third route added later is safe by
+    construction rather than by diligence.</strong> <code>paused</code> is deliberately treated as terminal here:
+    a parked paper is not scheduled, and resuming it must be able to create a fresh job.
+  </p>
+  <div class="note vio">
+    <span class="label">The same lesson, twice in one layer</span>
+    This is the second constraint in two chapters that replaces a check-then-act with a database guarantee — the
+    first being entity identity (ch. 13). The pattern is worth naming: <em>when two independent code paths must
+    agree on a uniqueness rule, the rule belongs to the schema.</em> A check in one caller protects that caller;
+    an index protects the invariant.
+  </div>
+
+  <h3 class="sub">Progress must describe work that still exists</h3>
+  <div class="note bad">
+    <span class="label">A paper reporting 100% while holding zero chunks</span>
+    A domain move clears the paper's contribution and queues a rebuild — but it reset the <em>status</em> and left
+    <code>processing_progress</code> alone, so the dashboard showed a completed bar for a paper whose extraction
+    no longer existed. Every path that clears contribution now resets progress in the same statement:
+    <code>?rebuild=true</code>, and the domain move.
+    <br/><br/>
+    A queued paper showing 60% is <strong>not</strong> the same bug — that figure describes chunks already
+    checkpointed, which resume will keep, and it is genuinely useful. The distinction is whether the work the
+    number refers to still exists.
+  </div>
+
+  <h3 class="sub">Shutdown is a signal, not a crash <span class="chip ok">built</span></h3>
+  <p>
+    Nothing handled <code>SIGTERM</code>, which made every deploy indistinguishable from a crash: connections cut
+    mid-response, the Postgres pool dropped without closing, and in-flight jobs went to lease-expiry recovery even
+    when two seconds from finishing. A deploy is the most frequent "failure" a service experiences, so it is the
+    one most worth handling properly.
+  </p>
+  <pre><span class="c">// Order matters, and each step has a reason.</span>
+server.<span class="f">close</span>()            <span class="c">// 1. stop accepting, so nothing new arrives to be abandoned</span>
+<span class="k">await</span> <span class="f">stopWorkers</span>()      <span class="c">// 2. stop claiming; drain in-flight for SHUTDOWN_GRACE_MS</span>
+<span class="k">await</span> <span class="f">closeDb</span>()          <span class="c">// 3. close the pool last, once nothing else needs it</span></pre>
+  <div class="note warn">
+    <span class="label">What shutdown deliberately does NOT do</span>
+    It does not release still-running claims. That would look like a faster handover and would be a correctness
+    bug: the job is <em>still executing in this process</em>, so another instance could claim it and both would
+    extract the same paper into the same graph concurrently. The lease exists precisely to make that impossible,
+    so interrupted work is left leased and recovered the safe way — by expiry, bounded by
+    <code>JOB_LEASE_TTL_MS</code>. The grace period is short by design: extraction takes ~15 minutes and no
+    supervisor waits that long before <code>SIGKILL</code>, so waiting for it would only convert a clean shutdown
+    into a killed one. Anything still in flight is <em>named</em> in the shutdown log, not summarised — an
+    operator reading it after a bad deploy needs to know exactly which work is coming back.
+  </div>
+
+  <h3 class="sub">Pause: cooperative, and never mid-chunk <span class="chip ok">built</span></h3>
+  <p>
+    An operator can park a paper between chunks. The processor checks before each chunk and stops cleanly — never
+    mid-chunk, which would discard the ~34&nbsp;s already spent and leave a partial extraction to reconcile. The
+    job moves to a <code>paused</code> state that is terminal for the queue (nothing claims it), releases its
+    lease, and <strong>consumes no retry</strong>.
+  </p>
+  <div class="note vio">
+    <span class="label">A pause recorded as a failure is the same lie as a failure shown as "Pending"</span>
+    Both are states the system knows and reports as something else. <code>paused</code> earned its own enum value
+    in both <code>processing_status</code> and <code>job_status</code> rather than borrowing <code>failed</code>,
+    because the difference is exactly what an operator needs to see. Resume and retry are then the same endpoint,
+    because they are the same operation: put it back on the queue and keep the checkpoint.
+  </div>
 
   <h3 class="sub">The reaper, and startup recovery</h3>
   <pre><span class="c">// reapExpiredJobs() — runs every 60 s, and once at startup with ownerFilter = INSTANCE_ID</span>
@@ -3339,6 +3764,282 @@ papers   = update papers set processing_status=<span class="s">'failed'</span>
 </div>
 
 <!-- ══════════════════════════ 18 ══════════════════════════ -->
+<!-- ══════════════════════════ 17b ══════════════════════════ -->
+<section class="feature" id="s17b">
+  <div class="feature-head">
+    <div class="feature-icon">17b</div>
+    <div>
+      <div class="feature-num">Chapter 17b · Write path</div>
+      <h2 class="feature-title">Graph density: when the graph is not the problem</h2>
+    </div>
+  </div>
+  <div class="feature-body">
+  <p>
+    A knowledge graph can satisfy every invariant in chapter 06 and still be useless, and that is what happened
+    here. The corpus reported <strong>441 nodes and 132 edges</strong> — 0.30 edges per node. The Explorer, freshly
+    redesigned, showed entities with one relationship each. The obvious diagnosis was that extraction was weak.
+    The obvious diagnosis was a third right, and the two thirds it missed were both structural.
+  </p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th style="width:230px">Measurement</th><th style="width:120px">Before</th><th style="width:120px">After</th><th>What it was</th></tr></thead>
+      <tbody>
+        <tr><td>Edges</td><td class="mono">132</td><td class="mono">552</td><td>Entities with no relationship had no edge at all</td></tr>
+        <tr><td>Edges per node</td><td class="mono">0.30</td><td class="mono">1.25</td><td>—</td></tr>
+        <tr><td><strong>Isolated nodes</strong></td><td class="mono">62.4%</td><td class="mono">3.6%</td><td>In the corpus, absent from the knowledge</td></tr>
+        <tr><td>Cross-paper bridges</td><td class="mono">0</td><td class="mono">rebuilding</td><td>The corpus was split across two domains</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 class="sub">Cause 1 · Entities and relationships are two separate lists</h3>
+  <p>
+    The extractor returns <code>{ entities[], relationships[] }</code>. Any entity the model named but did not
+    happen to place in a relationship became a node with <strong>no edges</strong> — unreachable by traversal,
+    invisible to PPR, and useless to a reader. That was 275 of 441 nodes. It is not a tuning problem; it is what
+    the output shape guarantees.
+  </p>
+  <pre><span class="c">// pipeline/processor.ts — every entity a chunk names is attached to the paper</span>
+<span class="k">const</span> mentionTargets = <span class="k">new</span> <span class="f">Set</span>&lt;<span class="k">string</span>&gt;();
+<span class="k">for</span> (<span class="k">const</span> entity <span class="k">of</span> resolverOutput.resolvedEntities) {
+  <span class="k">const</span> id = entity.canonicalId ?? entityMap.<span class="f">get</span>(…);
+  <span class="k">if</span> (id &amp;&amp; id !== paperNode) mentionTargets.<span class="f">add</span>(id);   <span class="c">// never a self-edge</span>
+}
+<span class="c">// one `mentions` edge per (paper, entity), with a chunk-attributed source row</span></pre>
+  <div class="note good">
+    <span class="label">A <code>mentions</code> edge is a record, not an inference</span>
+    We <em>know</em> this paper named this entity — that is the extraction record itself. It is also exactly the
+    structure the two real questions need: <strong>"what does this paper cover"</strong> is the paper's own edges,
+    and <strong>"what do two papers share"</strong> is a two-hop path through an entity both mention. Neither is
+    traversable unless the entity is attached to both papers in the first place.
+    <br/><br/>
+    It is chunk-attributed like any other claim, so a partial resume undoes it exactly as it undoes everything
+    else (ch. 15), and it carries provenance, so invariant 7 holds. <code>backfill:mentions</code> repairs a corpus
+    ingested before this — dry-run by default, because a backfill that writes 420 rows on first invocation is a
+    trap.
+  </div>
+  <div class="note warn">
+    <span class="label">The measurement that had to be taken before shipping it</span>
+    This adds a hub node with ~60 edges per paper, and hub topology drives PPR. Invariant 23 applies: the eval
+    harness was run before and after. Overall nDCG <strong>87.7%</strong>, multi-hop <strong>63.1%</strong>, hub
+    <strong>100%</strong> — unchanged. Had it regressed, the correct action was to revert, not to argue.
+  </div>
+
+  <h3 class="sub">Cause 2 · The corpus was severed, and severance looks like sparsity</h3>
+  <p>
+    Even with every entity attached to its paper, <strong>zero</strong> entities were shared between papers. Five
+    concepts existed twice — <code>self-attention</code>, <code>machine translation</code>, <code>RNNs</code>,
+    <code>attention-based models</code>, <code>learning rate schedule</code> — once in each copy, unable to merge.
+  </p>
+  <div class="note bad">
+    <span class="label">War story · six papers in <code>default</code>, one in <code>nlp</code></span>
+    Papers ingested without an explicit domain land in <code>default</code>. Resolution is domain-scoped by design
+    (invariants 1, 2, 4), so those six papers <em>could not</em> relate to the seventh, and a concept appearing in
+    both halves was two nodes by construction.
+    <br/><br/>
+    <strong>This is isolation working, not failing.</strong> The system was refusing to do the thing it promises
+    never to do. But the symptom — a sparse, disconnected graph — is indistinguishable from bad extraction, and
+    nothing surfaced the split. Days of work could be spent tuning an extractor that was not the problem.
+  </div>
+  <div class="note vio">
+    <span class="label">The diagnostic that should be reflexive</span>
+    <code>select domain, count(*) from papers group by 1;</code>
+    <br/><br/>
+    Before concluding that extraction is weak, confirm the corpus is in <em>one</em> place. A correctness
+    guarantee that partitions data will, when misconfigured, produce a result that looks exactly like a quality
+    problem. <code>POST /api/papers/:id/domain</code> moves a paper and queues a <strong>rebuild</strong>, not a
+    resume: the chunk texts are unchanged, but every identity decision the paper made was made against the wrong
+    neighbourhood, and carrying those checkpoints over would leave the paper and its entities disagreeing about
+    where they live.
+  </div>
+
+  <h3 class="sub">The move itself broke the invariant it was meant to preserve</h3>
+  <div class="note bad">
+    <span class="label">War story · a paper in one domain owning 255 nodes in another</span>
+    <code>clearPaperContributions</code> keeps nodes on purpose: within one domain they are canonical and shared,
+    so deleting them would cascade away other papers' edges. Across a <em>domain move</em> that reasoning
+    inverts — the nodes carry the old stamp and the paper has left. After moving six papers into <code>nlp</code>,
+    <strong>535 nodes were still stamped <code>default</code></strong>, 193 of them still connected, and a domain
+    with zero papers held more nodes than the one with all seven.
+    <br/><br/>
+    Invariant 4 — <em>a paper and its extracted entities must never disagree about which domain they are in</em> —
+    was broken by the operation written to preserve it. The symptom reached the UI as the same document listed
+    twice, which is how it was noticed at all.
+  </div>
+  <p>
+    The move now also removes nodes it owns in the old domain that nothing else references — a node another paper
+    there still asserts an edge to is still that domain's and survives.
+    <code>repair:domain-drift</code> audits any corpus for the same disagreement and fixes it; it is a dry run
+    unless asked otherwise, because a repair that deletes 535 rows on first invocation is a trap.
+  </p>
+
+  <h3 class="sub"><code>type = 'paper'</code> is not "an ingested document"</h3>
+  <div class="note bad">
+    <span class="label">War story · seven papers, eighty-five paper nodes</span>
+    The extractor creates a paper node for every work a document <em>cites</em>, which is correct — a citation is
+    an entity. But the Explorer's paper list filtered on <code>type = 'paper'</code> and therefore offered
+    seventy-four citation targets like <code>"arXiv preprint arXiv:1601.06733"</code> as documents to study.
+    They have no text, no chunks, and nothing to show.
+    <br/><br/>
+    The fix is exact rather than heuristic. <code>getOrCreatePaperNode</code> stamps a document's own node with
+    <code>paper_id</code> pointing at itself <em>and</em> <code>normalized_name</code> equal to its title; a
+    citation target carries the citing paper's id, so it cannot satisfy both halves.
+  </div>
+
+  <h3 class="sub">Cause 3 · Extraction, which is now the binding constraint <span class="chip warn">partial</span></h3>
+  <p>
+    With the plumbing fixed, what remains is genuinely extraction quality — and the lens view makes it visible
+    rather than hiding it inside a drawing. Two problems, both measurable:
+  </p>
+  <div class="cols-2">
+    <div class="card"><div class="card-head"><span class="card-title">Few semantic relationships</span><span class="card-tag">~24%</span></div>
+      <div class="card-body"><p>101 of 422 edges are anything other than <code>mentions</code>. The extractor names many entities and states few relationships between them, so a paper's lens shows one "Introduces" and ninety-seven "Also covers".</p></div></div>
+    <div class="card"><div class="card-head"><span class="card-title">Fragments as entity names</span><span class="card-tag">unmergeable</span></div>
+      <div class="card-body"><p><code>"model achieves a BLEU score of 41.0, out"</code>, <code>"English-to-German translation on the dev"</code>. These are sentence spans, not entities. They can never match anything, so they inflate the node count permanently and pollute every list.</p></div></div>
+  </div>
+  <div class="note warn">
+    <span class="label">And there is no harness for it</span>
+    Retrieval quality has an eval harness and two reversed decisions to show for it (ch. 49). Extraction quality
+    has neither — no labelled set, no metric, no sweep. Until it does, any change to the extraction prompt is the
+    same kind of guess the PPR alpha change was, and should be treated with the same suspicion. This is the
+    highest-value unbuilt harness in the system.
+  </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════ 17c ══════════════════════════ -->
+<section class="feature" id="s17c">
+  <div class="feature-head">
+    <div class="feature-icon">17c</div>
+    <div>
+      <div class="feature-num">Chapter 17c · Write path</div>
+      <h2 class="feature-title">The graph-quality audit: a cleaner that proposes</h2>
+    </div>
+  </div>
+  <div class="feature-body">
+  <p>
+    Extraction produces things that are not entities. Read straight off the live graph:
+  </p>
+  <pre>  "dmodel = 512"                                                   <span class="c">← a formula</span>
+  "FFN(x) = max(0, xW1 + b1)W2 + b2 (2)"                           <span class="c">← a formula</span>
+  "a model architecture eschewing recurrence and instead relying"  <span class="c">← a clause</span>
+  "input-feeding approach in which attentional vectors ht are con" <span class="c">← truncated</span>
+  "our input-feeding approach"  /  "input-feeding approach"        <span class="c">← one entity, twice</span></pre>
+  <p>
+    These can never merge with anything, they inflate every count, and they fill the entry-point lists a reader
+    chooses from. The extractor learning not to emit them is the real fix and is not yet measurable; naming them
+    afterwards is cheap and available now.
+  </p>
+
+  <h3 class="sub">Why it cannot live inside extraction</h3>
+  <div class="cols-2">
+    <div class="card"><div class="card-head"><span class="card-title">Not on the critical path</span></div>
+      <div class="card-body"><p>Extraction is GPU-bound and already the bottleneck. Adding graph-wide analysis to it slows the thing that matters to improve something that can wait.</p></div></div>
+    <div class="card"><div class="card-head"><span class="card-title">It needs the finished graph</span><span class="card-tag">the real reason</span></div>
+      <div class="card-body"><p>Whether "our input-feeding approach" and "input-feeding approach" are one entity is a question about the <em>corpus</em>, not the chunk. At write time resolution has only the mention in front of it. <strong>A cleaner running per-chunk would ask resolution's question with resolution's information and get resolution's answer.</strong></p></div></div>
+  </div>
+  <p>
+    So it is a third lane on the durable queue — <code>audit×1</code>, alongside <code>ingest</code> and
+    <code>process</code> — and inherits retries, leases and restart survival for free. Concurrency one, because
+    two audits of the same domain would each delete the other's proposals. It is CPU work, so it must not queue
+    behind a fifteen-minute extraction: an operator asking "what is wrong with my graph" should not wait for the
+    GPU.
+  </p>
+
+  <h3 class="sub">It proposes; it does not clean</h3>
+  <div class="note warn">
+    <span class="label">The asymmetry, sharpened</span>
+    The doctrine governing merges (invariant 28) governs cleaning with more force. A false <em>merge</em>
+    destroys a distinction. A false <em>drop</em> destroys the distinction <strong>and the evidence</strong>, and
+    leaves no record the node ever existed. So every finding carries a verdict, a stated reason and a confidence,
+    and applying is a separate, explicit act by someone who can read the reason.
+  </div>
+  <p>
+    That is not caution for its own sake. Real data is full of pairs that look like duplicates and are not:
+  </p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th style="width:290px">Pair</th><th style="width:110px">Verdict</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><code>Base + reverse</code> / <code>Base + reverse + dropout</code></td><td><span class="chip warn">review</span></td><td>Two ablation configurations, not one entity</td></tr>
+        <tr><td><code>WMT</code> / <code>WMT translation tasks between…</code></td><td><span class="chip warn">review</span></td><td>Two granularities</td></tr>
+        <tr><td><code>Bahdanau et al., 2015</code> / <code>Bahdanau et al., 2015; Jean et al., 2015</code></td><td><span class="chip warn">review</span></td><td>A citation list and one of its members</td></tr>
+        <tr><td><code>our input-feeding approach</code> / <code>input-feeding approach</code></td><td><span class="chip ok">merge</span></td><td>Identical once a leading determiner is dropped</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 class="sub">The detectors, and what each is allowed to conclude</h3>
+  <p>
+    Length alone is a bad detector — <code>WMT 2014 English-to-German translation task</code> is 43 characters and
+    perfectly good. What distinguishes a fragment is <em>structure</em>:
+  </p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th style="width:180px">Signal</th><th style="width:100px">Verdict</th><th>Rationale</th></tr></thead>
+      <tbody>
+        <tr><td>Formula notation</td><td><span class="chip bad">drop</span> high</td><td><code>=</code>, <code>∑</code>, <code>∈</code>, arithmetic — an equation, not a name</td></tr>
+        <tr><td>Finite clause, &gt;45 chars</td><td><span class="chip bad">drop</span> high</td><td>"we", "which", "that" inside a long string is running prose</td></tr>
+        <tr><td>Ends on a preposition</td><td><span class="chip bad">drop</span> high</td><td>The extracted span was cut</td></tr>
+        <tr><td>Ends mid-infinitive</td><td><span class="chip bad">drop</span> high</td><td>"…through a task to predict"</td></tr>
+        <tr><td>Opens with a bare article</td><td><span class="chip bad">drop</span> high</td><td>Entity names rarely do; sentences lifted from a paragraph almost always do</td></tr>
+        <tr><td>Citation marker</td><td><span class="chip warn">review</span></td><td>May be a genuine referenced work the graph should keep</td></tr>
+        <tr><td>No edges at all</td><td><span class="chip warn">review</span></td><td>Usually a real entity whose paper has not been rebuilt yet</td></tr>
+        <tr><td>&gt;80 chars, no structural tell</td><td><span class="chip warn">review</span> low</td><td>Suspicious, not condemned</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="note vio">
+    <span class="label">Every length rule is gated, for one specific reason</span>
+    <code>3D Gaussian Splatting</code> ends in a participle and is a perfectly good entity. Each truncation rule
+    therefore fires only above 45 characters. A rule that is right about the corpus and wrong about the flagship
+    example is not right.
+  </div>
+
+  <h3 class="sub">Two bugs the tool found in itself</h3>
+  <div class="note bad">
+    <span class="label">War story · the survivor chosen by length</span>
+    The first version proposed merging <code>previous state-of-the-art models</code> into
+    <code>previous state-of-the-art&nbsp;</code> — keeping a truncated fragment and discarding the good name.
+    "Shorter is better" is the usual case, because the longer name is longer where the extractor swept in
+    surrounding words. It fails exactly where it matters. <strong>The survivor is now chosen by quality first: a
+    name the detectors would reject can never win.</strong>
+  </div>
+  <div class="note bad">
+    <span class="label">War story · two truncated clauses that scored as clean</span>
+    <code>"a model architecture eschewing recurrence and instead relying"</code> and
+    <code>"…through a task to predict"</code> both passed the first detector set — no clause marker from the
+    list, no trailing preposition. The tests caught them, which is the point of writing the tests from real names
+    rather than from imagined ones. Both tells (opening article, trailing infinitive) are now encoded.
+  </div>
+
+  <h3 class="sub">The result on this corpus</h3>
+  <pre>Scanned 579 node(s) in "nlp": 310 finding(s)
+  23 drop  · high confidence   — formulae and sentence fragments
+  23 merge · 1 high, 22 medium — determiner-identical and generic-word variants
+ 264 review                    — citations, orphans, and nested names
+Nothing was changed.</pre>
+  <div class="note good">
+    <span class="label">Dismissals persist, deliberately</span>
+    A rejected finding is marked <code>dismissed</code> rather than deleted, so the next audit does not re-propose
+    what a human already refused. <strong>A tool that keeps asking the same question gets ignored</strong> — which
+    is how a quality system stops working without anyone deciding to switch it off.
+  </div>
+
+  <h3 class="sub">Surfaces</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th style="width:290px">Endpoint</th><th style="width:80px">Scope</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><span class="chip post">POST</span> <code>/api/graph/audit</code></td><td>write</td><td>Queues an audit job. Returns 202 immediately.</td></tr>
+        <tr><td><span class="chip get">GET</span> <code>/api/graph/findings</code></td><td>identity</td><td>Ordered <strong>by confidence</strong>, so an operator working top-down is not asked to adjudicate the hard cases while warming up.</td></tr>
+        <tr><td><span class="chip post">POST</span> <code>/api/graph/findings/apply</code></td><td>write</td><td><code>apply[]</code> / <code>dismiss[]</code>. Every id is checked to belong to the caller's domain first — a finding id is otherwise a way to delete a node in a domain you cannot read.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  </div>
+</section>
+
 <section class="feature" id="s18">
   <div class="feature-head">
     <div class="feature-icon">18</div>
@@ -5457,6 +6158,10 @@ ALTER ROLE manifold_app NOBYPASSRLS;
         <tr><td><span class="chip get">GET</span> <code>/api/graph/stats</code></td><td>identity</td><td>Counts by type. Scoped — aggregates leak too.</td></tr>
         <tr><td><span class="chip get">GET</span> <code>/api/graph/types</code></td><td>identity</td><td>Distinct types actually present. <strong>Drives the UI's filters dynamically</strong>, so a newly-invented type appears without a frontend change — invariant 19 made visible in the product.</td></tr>
         <tr><td><span class="chip get">GET</span> <code>/api/graph/queries/improves-3dgs</code><br/><span class="chip get">GET</span> <code>/api/graph/queries/extends-3dgs</code></td><td>identity</td><td><span class="chip bad">a vertical hardcoded into the public API surface.</span> Should be <code>/queries/relationships?type=improves&amp;target=…</code>. Ch. 67.</td></tr>
+        <tr><td><span class="chip get">GET</span> <code>/api/graph/hubs</code></td><td>identity</td><td><code>?domain=&amp;type=&amp;limit=</code>. Most-connected entities, ranked <strong>in SQL over the whole domain</strong>, limit clamped to 200. Replaces a client-side ranking over a 500-edge sample that was not merely incomplete but <em>wrong</em>.</td></tr>
+        <tr><td><span class="chip get">GET</span> <code>/api/graph/papers</code></td><td>identity</td><td>Papers as entry points, with concept and claim counts — enough signal to choose one.</td></tr>
+        <tr><td><span class="chip get">GET</span> <code>/api/graph/lens/:id</code></td><td>identity</td><td>One node read as an argument: edges grouped by the question they answer, both directions, correctly inverted, each with its evidence sentence. Pinned to the centre node's domain like every other traversal.</td></tr>
+        <tr><td><span class="chip get">GET</span> <code>/api/graph/compare</code></td><td>identity</td><td><code>?a=&amp;b=</code>. Shared and divergent concepts. Returns <code>409</code> with an actionable message when the two are in different domains — <em>more useful than an empty intersection that looks like they have nothing in common.</em></td></tr>
         <tr><td><span class="chip get">GET</span> <code>/api/graph/queries/provenance/:edgeId</code></td><td>identity</td><td>Paper title, arXiv id, section, extracted span. <strong>The endpoint that makes "citable" real.</strong></td></tr>
       </tbody>
     </table>
@@ -5481,8 +6186,12 @@ ALTER ROLE manifold_app NOBYPASSRLS;
         <tr><td><span class="chip post">POST</span> <code>/api/ingest/connector/:id</code></td><td>write</td><td>Structured connectors run <strong>inline</strong> and return the graph; 201. The one path that still executes in the request, because it makes no model calls.</td></tr>
         <tr><td><span class="chip get">GET</span> <code>/api/ingest/connectors</code></td><td>identity</td><td>Reports <code>llmCallsPerDocument</code> per connector — cost as part of the interface.</td></tr>
         <tr><td><span class="chip get">GET</span> <code>/api/ingest/status/:jobId</code></td><td>identity</td><td>The durable row, including <code>attempts</code>. <span class="chip warn">no ownership check</span> — any authenticated caller can read any job id. Low severity (ids are unguessable), still wrong. Ch. 67.</td></tr>
-        <tr><td><span class="chip post">POST</span> <code>/api/papers/:id/process</code></td><td>write</td><td>Chooses <code>reprocessPaper</code> vs <code>processPaper</code> by whether the paper already contributed.</td></tr>
-        <tr><td><span class="chip get">GET</span> <code>/api/papers/processing</code></td><td>identity</td><td><span class="chip bad">not domain-filtered</span> — returns in-progress papers across every domain, including titles. A real leak; ch. 67.</td></tr>
+        <tr><td><span class="chip post">POST</span> <code>/api/papers/:id/process</code></td><td>write</td><td>Inserts a durable <code>process</code> row and returns 202. The handler always clears before extracting, so first-run and re-run are one idempotent operation.</td></tr>
+        <tr><td><span class="chip post">POST</span> <code>/api/papers/:id/pause</code></td><td>write</td><td>Cooperative: stops at the next chunk boundary. A job not yet claimed is parked immediately — there is nothing to interrupt.</td></tr>
+        <tr><td><span class="chip post">POST</span> <code>/api/papers/:id/resume</code></td><td>write</td><td><strong>Resume and retry are the same endpoint</strong>, because they are the same operation. Keeps completed chunks; <code>?rebuild=true</code> opts into starting over. Refuses to create a second job for a paper already scheduled.</td></tr>
+        <tr><td><span class="chip get">GET</span> <code>/api/papers/:id/chunks</code></td><td>identity</td><td>Per-chunk progress: what extracted, what is left, what failed.</td></tr>
+        <tr><td><span class="chip post">POST</span> <code>/api/papers/:id/domain</code></td><td>write</td><td>Moves a paper and <strong>rebuilds</strong> its contribution. Authorised on <em>both</em> domains — a caller who may only write the target could otherwise pull data across a boundary they do not hold.</td></tr>
+        <tr><td><span class="chip get">GET</span> <code>/api/papers/processing</code></td><td>identity</td><td>The operations view. Returns <code>failed</code> and <code>paused</code> too (invariant 27), each paper carrying <code>queue: {state, position}</code> and the configured lane width. <span class="chip bad">not domain-filtered</span> — still returns in-progress papers across every domain, including titles. A real leak; ch. 67.</td></tr>
         <tr><td><span class="chip post">POST</span> <code>/api/domains/backfill</code></td><td><strong>admin</strong></td><td>The most destructive endpoint in the API: rewrites five tables, no inverse. Guarded by a registry check <em>and</em> a <code>dryRun</code> that reports per-table counts before you commit.</td></tr>
         <tr><td><span class="chip post">POST</span> <code>/api/admin/principals</code></td><td>admin</td><td>Key returned <strong>once</strong>, with the warning in the payload. <code>domains</code> is required — <code>["*"]</code> must be explicit.</td></tr>
         <tr><td><span class="chip get">GET</span> <code>/api/admin/audit</code></td><td>admin</td><td><span class="chip bad">cross-tenant readable.</span> Ch. 35 A10.</td></tr>
@@ -5730,8 +6439,8 @@ console.log = (...args) =&gt; console.<span class="f">error</span>(...args);</pr
 
   <h3 class="sub">What exists</h3>
   <div class="cols-3">
-    <div class="card"><div class="card-head"><span class="card-title">Dashboard</span><span class="card-tag">355 lines</span></div><div class="card-body"><p>Stats by type, papers in progress, recent activity. Polls <code>/api/papers/processing</code> every ~2 s.</p></div></div>
-    <div class="card"><div class="card-head"><span class="card-title">Explorer</span><span class="card-tag">~800 lines</span></div><div class="card-body"><p>React Flow canvas. Type filter (driven by <code>/api/graph/types</code>, not a hardcoded list), a <strong>confidence slider</strong> to hide weak edges, a node cap for large graphs, click-to-inspect — and now an <strong>ego view</strong> (below).</p></div></div>
+    <div class="card"><div class="card-head"><span class="card-title">Dashboard</span><span class="card-tag">355 lines</span></div><div class="card-body"><p>Stats by type, papers in progress, recent activity. Adaptive polling of <code>/api/papers/processing</code> — 2 s while work is active, 30 s when idle. Shows real per-paper state (<em>failed</em>, <em>paused</em>, <em>extracting · 88%</em>) with Retry / Pause / Resume controls, rather than a <code>processed</code> boolean that reported failures as "Pending".</p></div></div>
+    <div class="card"><div class="card-head"><span class="card-title">Explorer</span><span class="card-tag">3 lenses</span></div><div class="card-body"><p>No canvas. Three question-shaped views — <strong>Paper</strong>, <strong>Concept</strong>, <strong>Compare</strong> — over server-ranked entry points. Type filters still come from <code>/api/graph/types</code> rather than a hardcoded list, so a newly-invented type appears without a frontend change. See below for why the drawing went away.</p></div></div>
     <div class="card"><div class="card-head"><span class="card-title">Ingestion</span><span class="card-tag">316 lines</span></div><div class="card-body"><p>Submit arXiv ids, watch job status. Polls.</p></div></div>
   </div>
 
@@ -5756,28 +6465,179 @@ nodes.<span class="f">forEach</span>((node, i) =&gt; {
     would have hidden the determinism decision behind a default.
   </div>
 
-  <h3 class="sub">The ego layout: focus + context, not a hairball</h3>
+  <h3 class="sub">Three designs, and why the first two failed</h3>
   <p>
-    A force-directed layout is the right default for "show me the graph". It is the <em>wrong</em> answer for
-    "show me <em>this node</em>" — the answer to that is a hairball with your node somewhere in it.
-    <code>computeEgoLayout()</code> is the second layout, and it encodes a genuine information-design idea rather
-    than a prettier physics:
+    The Explorer has been rebuilt three times, and the first two failed for the same reason — worth recording,
+    because the failure is a general one about visualising graphs.
+  </p>
+  <div class="ladder">
+    <div class="step"><div class="n">1</div><div class="b"><strong>Force-directed overview.</strong> The right default for "show me the graph", and unreadable in practice: sixty boxes in one simulation, no matter how styled. Two rounds of tuning proved the <em>idea</em> was wrong, not the parameters. A global layout answers a question nobody asks.</div></div>
+    <div class="step"><div class="n">2</div><div class="b"><strong>Ego view.</strong> Fixed the readability — one node, its neighbours, direction encoded as position, every label legible. It still only answered <em>"what is next to this?"</em>, and <strong>a list of neighbours is not an explanation.</strong> On real data it showed <code>architecture</code> with a single edge and taught nothing.</div></div>
+    <div class="step"><div class="n">3</div><div class="b"><strong>Three lenses.</strong> Not a better drawing — a different question. The graph is read as an <em>argument</em>, grouped by what the edges mean.</div></div>
+  </div>
+  <div class="note vio">
+    <span class="label">The lesson generalises beyond this page</span>
+    Rounds 1 and 2 were both attempts to draw the data better. The thing that actually helped was asking what
+    somebody wants to <em>know</em> and building the answer to that. <strong>A graph visualisation is a means, and
+    it is very easy to mistake it for the product.</strong>
+  </div>
+
+  <h3 class="sub">The three lenses <span class="chip ok">built</span></h3>
+  <div class="cols-3">
+    <div class="card"><div class="card-head"><span class="card-title">Paper</span><span class="card-tag">within one paper</span></div>
+      <div class="card-body"><p>What this work introduces, what it builds on, what it uses, how it was validated, what it claims to beat. One paper read as an argument.</p></div></div>
+    <div class="card"><div class="card-head"><span class="card-title">Concept</span><span class="card-tag">one idea</span></div>
+      <div class="card-body"><p>What introduced this idea, what builds on it, where the corpus uses it.</p></div></div>
+    <div class="card"><div class="card-head"><span class="card-title">Compare</span><span class="card-tag">between papers</span></div>
+      <div class="card-body"><p>Two papers side by side: shared in the middle, divergences on the flanks. Each shared concept is literally a two-hop path between them.</p></div></div>
+  </div>
+  <p>
+    The grouping lives in <code>knowledge-field/lens.ts</code>. Relationship types are folded into <em>roles</em>,
+    because a learner does not care that one edge says <code>evaluates_on</code> and another says
+    <code>achieves</code> — both answer "how do we know this works". Types stay open (invariant 19): an
+    unrecognised type is matched by substring, kept verbatim, and falls through to <code>covers</code> rather than
+    being renamed or dropped.
   </p>
   <div class="tablewrap">
     <table>
-      <thead><tr><th style="width:200px">Rule</th><th>Why</th></tr></thead>
+      <thead><tr><th style="width:150px">Section</th><th style="width:250px">The question it answers</th><th>Edge types folded in</th></tr></thead>
       <tbody>
-        <tr><td><strong>Direction becomes position.</strong> Outgoing neighbours on the right arc (−70°…70°), incoming on the left (110°…250°).</td><td>Edge direction is the hardest thing to read on an arrowed graph. Making it <em>spatial</em> means "what does this extend" and "what extends this" are answered by looking left or right, before reading a single label.</td></tr>
-        <tr><td><strong>Radius derived from required arc length</strong> — ~64 px of arc per node.</td><td>A fixed radius either wastes space with three neighbours or overlaps labels with thirty. Solving for the radius that fits the labels is the difference between a layout and a diagram.</td></tr>
-        <tr><td><strong>Second hop on a short spur outward from its parent</strong>, fanned ±0.35 rad.</td><td>Preserves the visual claim that this node is reached <em>through</em> that one — the two-hop structure stays legible instead of collapsing into a second ring.</td></tr>
-        <tr><td><strong>Both-direction neighbours count as outgoing.</strong></td><td>An explicit tie-break, commented: <em>"its arc position matters less than having exactly one."</em> A node placed twice is worse than a node placed on the less-informative side.</td></tr>
+        <tr><td><strong>Introduces</strong></td><td>What this work puts forward as new.</td><td><code>introduces</code>, <code>proposes</code>, <code>presents</code>, <code>contributes</code></td></tr>
+        <tr><td><strong>Builds on</strong></td><td>The lineage it belongs to.</td><td><code>extends</code>, <code>improves</code>, <code>fine_tunes</code>, <code>based_on</code></td></tr>
+        <tr><td><strong>Uses</strong></td><td>Components it depends on.</td><td><code>uses</code>, <code>computes</code>, <code>applies</code>, <code>requires</code></td></tr>
+        <tr><td><strong>Validated on</strong></td><td>What its claims rest on.</td><td><code>evaluates_on</code>, <code>achieves</code>, <code>trained_on</code></td></tr>
+        <tr><td><strong>Compared with</strong></td><td>What it measures itself against.</td><td><code>outperforms</code>, <code>compares_to</code>, <code>beats</code></td></tr>
+        <tr><td><strong>Also covers</strong></td><td>Named, without a stated relationship.</td><td><code>mentions</code>, and anything unrecognised</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="note good">
+    <span class="label">Three details that make it teach rather than display</span>
+    <strong>Order is fixed, not sorted by size.</strong> It is the order the questions get asked — contribution
+    before lineage, evidence before boasts. Sorting by count would put "Also covers" first on every paper.
+    <br/><br/>
+    <strong>Every section carries a one-line hint</strong> saying what it means. That sentence is the teaching
+    part; without it the headings are jargon.
+    <br/><br/>
+    <strong>Every claim has a "why?"</strong> that opens the sentence it was extracted from. A knowledge graph
+    whose edges cannot be checked is asking to be trusted rather than read — and the provenance to do it was
+    already there, unused by the UI (ch. 16).
+  </div>
+  <div class="note warn">
+    <span class="label">Direction changes meaning, not just arrow heads</span>
+    "A extends B" is part of A's lineage and part of B's legacy. Filing an <em>incoming</em> <code>extends</code>
+    under "Builds on" would tell the reader the exact opposite of what happened, so
+    <code>roleForIncomingEdgeType</code> inverts the pair — incoming <code>extends</code> lands under
+    <strong>Introduces</strong>, phrased <code>extended by</code>. The same edge teaches a different thing from
+    each end.
+  </div>
+
+  <h3 class="sub">One heartbeat, not three timers</h3>
+  <p>
+    Fixing the <code>processing-papers</code> interval fixed one third of the problem. Two other queries — graph
+    statistics and the recent-papers list — polled on their own schedules, so an idle dashboard still produced
+    this, forever:
+  </p>
+  <pre>GET /api/graph/stats          200
+GET /api/papers?limit=10      200
+GET /api/papers/processing    200      <span class="c">← every couple of seconds, nothing running</span></pre>
+  <p>
+    Neither of the first two can change unless a paper finishes. They now poll only while
+    <code>workers.running + workers.queued &gt; 0</code> and are <strong>off</strong> otherwise —
+    <code>refetchInterval: false</code>, which is no timer rather than a slow one.
+    <code>processing-papers</code> keeps a 30-second beat because it is the one query that has to notice work
+    <em>starting</em> somewhere else: another tab, the ingestion page, a second client.
+  </p>
+  <div class="note good">
+    <span class="label">Measured</span>
+    Idle traffic falls from <strong>45 requests per minute to 2</strong>. The cost was never only log noise:
+    each one is a query against the papers table, and on the API side they share a rate limit with real work.
+  </div>
+  <div class="note vio">
+    <span class="label">And an animation that never stops stops meaning anything</span>
+    The Processing Papers header spinner span unconditionally. A dashboard with every paper paused looked
+    identical to one grinding through a hundred-document batch. It now animates only while work is moving — the
+    same <code>isBusy</code> signal that gates the polling, so the two can never disagree about whether anything
+    is happening.
+  </div>
+
+  <h3 class="sub">Reading a distribution that keeps growing</h3>
+  <p>
+    Entity and relationship types are open (invariant 19), so the dashboard's two distribution panels only ever
+    get longer — seventeen node types and thirteen edge types on a seven-paper corpus. Rendered as a plain
+    unbounded list they failed in three separate ways, each of which worsens with scale:
+  </p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th style="width:130px">Problem</th><th>Why it mattered</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Unsorted</strong></td><td>The API returns whatever order the <code>GROUP BY</code> produced, so the two largest types sat above and below a type with two members. <em>A distribution nobody can rank is a list, not a distribution.</em></td></tr>
+        <tr><td><strong>Unbounded</strong></td><td>Seventeen rows pushed every panel below them off the screen.</td></tr>
+        <tr><td><strong>Unreadable</strong></td><td>Bars scaled to the <em>total</em> leave every type invisible beside a dominant one. At 72.7%, <code>mentions</code> rendered the other twelve as slivers.</td></tr>
       </tbody>
     </table>
   </div>
   <p>
-    Like <code>computeForceLayout</code>, it is deterministic and dependency-free. Together they are the clearest
-    example in the frontend of the same discipline the backend applies: <strong>two layouts because there are two
-    questions</strong>, in the same way there are two retrieval modes because there are two callers (ch. 25).
+    Bars are now scaled to the <strong>largest</strong> type, which is what makes them comparable to one another,
+    while the label carries the true share of the total. The bar answers "how does this compare"; the number
+    answers "how much is it". A 1.5% floor keeps a single-member type visible as a mark rather than as nothing.
+    Both panels cap their height and scroll, so the card keeps its size however many types exist.
+  </p>
+  <div class="note good">
+    <span class="label">The one number the panel exists to surface</span>
+    <code>mentions</code> is structural — every entity is attached to the paper that named it (invariant 29) — so
+    it dominates <em>by construction</em> and says nothing about extraction quality. The panel therefore states
+    the share that is <strong>not</strong> mentions: <em>"213 semantic claims (27%) — the rest attach entities to
+    their paper."</em> That 27% is the binding constraint on graph quality (ch. 17b), and before this it was
+    buried inside a bar that looked healthy because it was long.
+  </div>
+
+  <h3 class="sub">A signal that counted rows instead of work</h3>
+  <div class="note bad">
+    <span class="label">War story · the same bug, reintroduced from three files away</span>
+    The dashboard polls <code>/api/papers/processing</code> every 2&nbsp;s while work is moving and every 30&nbsp;s
+    when it is not. The original complaint that produced that adaptive interval was <em>"the processing API is
+    still being hit when no paper is being processed"</em>.
+    <br/><br/>
+    Then invariant 27 made that endpoint return <code>failed</code> and <code>paused</code> papers, so their
+    Retry and Resume controls could be reached. The interval was keyed on the <strong>length of the returned
+    list</strong> — and the list is never empty while anything is parked. The dashboard went back to polling every
+    two seconds forever with nothing running, and the same complaint came back.
+    <br/><br/>
+    Neither change was wrong. The coupling was invisible: a decision in the frontend depended on a property of
+    the API payload that nobody had written down as a contract.
+  </div>
+  <p>
+    The interval now reads <code>workers.running + workers.queued</code> — what is claimed and what is waiting,
+    rather than what is displayed. A DB test pins it: a paused paper and a failed paper both appear in the list
+    and contribute <strong>zero</strong> to <code>workers</code>. That test is the contract the first version
+    lacked.
+  </p>
+  <div class="note vio">
+    <span class="label">And a control that fails silently is worse than no control</span>
+    Both mutations logged failures to <code>console.error</code> and nothing else. An operator clicking Resume on
+    a paper that will not resume sees exactly what they would see if the request were merely slow. Errors now
+    render where the buttons are — a broken button must be distinguishable from a working one.
+  </div>
+
+  <h3 class="sub">Ranking belongs where the data is</h3>
+  <div class="note bad">
+    <span class="label">War story · a "most connected" list that was not</span>
+    The sidebar fetched 500 nodes and 500 edges and counted degrees <em>in the browser</em>, then showed the top
+    14. The display cap merely hid entities. The <strong>sample</strong> cap made the ranking itself false: degree
+    counted over an arbitrary 500 edges is not degree, so past a few hundred edges "most connected" silently meant
+    "whichever hubs fell inside the window". Nine entity types existed in the corpus and the list surfaced three.
+    <br/><br/>
+    <code>GET /api/graph/hubs</code> now counts in SQL over the whole domain, with a type filter so a sparse
+    category is reachable rather than buried, and a <em>Show more</em> control — because a capped list must say it
+    is capped and offer the rest. This is the same defect class as ranking over a candidate window instead of an
+    index (invariant 24), on the read side.
+  </div>
+  <p>
+    <code>computeForceLayout</code> and <code>computeEgoLayout</code> remain in <code>lib/layout.ts</code>,
+    unused by the current Explorer. They are kept because the determinism argument above still holds and a future
+    map view will want them — but the honest label is <span class="chip warn">partial</span>: shipped code with no
+    caller is a maintenance liability, not an asset.
   </p>
 
   <h3 class="sub">The gaps, ranked by what they cost</h3>
@@ -6805,13 +7665,15 @@ pnpm --filter api eval -- --sweep-weights     <span class="c"># six graph/vector
       <tbody>
         <tr><td><strong>Extraction quality</strong></td><td><span class="chip warn">critical → in progress</span></td><td><strong>Graph quality caps answer quality.</strong> A real run (arXiv 1706.03762, 26 chunks, qwen2.5:7b) produced a 111-node/47-edge graph with genuinely useful entities — <code>Transformer</code>, <code>multi-head attention</code>, <code>BLEU</code>, <code>WMT 2014 En-De</code> — <em>and</em> noise: run-on phrases stored as entities, and a relationship extracted from the acknowledgments. <code>eval/gold.ts</code> now supplies hand-curated <code>ExtractionCase</code>s with alias sets; <strong>the instrument exists, the scored number does not yet.</strong></td></tr>
         <tr><td><strong>Groundedness</strong></td><td><span class="chip warn">critical → in progress</span></td><td>Does every claim in the answer appear in the returned evidence? Evidence is numbered <code>[1]…[n]</code> specifically to make this checkable, and <code>gold.ts</code>'s <code>QACase.mustMention</code> is the assertion shape. Wiring it into the scorecard is the remaining work.</td></tr>
-        <tr><td><strong>Resolution threshold</strong></td><td><span class="chip warn">high → in progress</span></td><td><code>SIM_THRESHOLD = 0.82</code> has never been swept. <code>gold.ts</code>'s <code>ResolutionCase</code> now provides both aliases (must merge) <em>and</em> distractors (must not) — the two-sided test a threshold sweep needs.</td></tr>
+        <tr><td><strong>Resolution — false <em>merges</em></strong></td><td><span class="chip ok">closed</span></td><td><strong>Measured, and the result inverted the design.</strong> Every same-type pair above 0.82 in the live graph was two different things (ch. 13). Cosine alone cannot decide identity; <code>merge-guard.ts</code> now requires a justification and all 7 observed pairs are refused with a stated reason.</td></tr>
+        <tr><td><strong>Resolution — false <em>splits</em></strong></td><td><span class="chip warn">high</span></td><td>The guard is deliberately conservative, so the open question flipped: <em>how many genuine synonyms is it now keeping apart?</em> Splits are visible and fixable, which is why they were chosen — but nobody has counted them. A merge-decision audit table would make both directions measurable; today only refusals are logged.</td></tr>
         <tr><td><strong>Contradiction rate</strong></td><td><span class="chip warn">high</span></td><td>When two sources disagree, both become edges with confidence scores. <em>Silently averaging contradictions is the wrong behaviour for a system meant to prevent errors.</em> <code>agents/repair.ts</code> now <em>detects</em> temporal and mutual contradictions at zero LLM cost (ch. 14) — but it has no route, no schedule, and no metric, so the <strong>rate</strong> is still unmeasured.</td></tr>
         <tr><td><strong>Real-corpus quality</strong></td><td><span class="chip warn">high</span></td><td>The scorecard is a constructed corpus in a lexical embedding space. Real embeddings, a real corpus, human-labelled gold, and a second domain.</td></tr>
         <tr><td><strong>Concurrent latency</strong></td><td><span class="chip warn">high</span></td><td>Never measured under concurrency. The connection pool is <code>max: 10</code>.</td></tr>
         <tr><td><strong>Latency at 1M entities</strong></td><td><span class="chip warn">high</span></td><td>The stated exit criterion. Measured at 100k (193 ms p95); the target is &lt;150 ms at 1M.</td></tr>
         <tr><td><strong>Dollar cost</strong></td><td><span class="chip warn">medium</span></td><td>Tokens are measured; cost is manual. No per-tenant attribution.</td></tr>
-        <tr><td><strong>Resolution threshold</strong></td><td><span class="chip warn">medium</span></td><td><code>SIM_THRESHOLD = 0.82</code> has never been swept against a labelled set. Over-merging is irreversible.</td></tr>
+        <tr><td><strong>Extraction relationship density</strong></td><td><span class="chip bad">critical</span></td><td>Only ~24% of edges are semantic (101 of 422); the rest are <code>mentions</code>. And some "entities" are sentence fragments, which are unmergeable by construction and inflate the node count permanently. <strong>This is now the binding constraint on graph quality</strong> (ch. 17b), and there is no harness for it.</td></tr>
+        <tr><td><strong>Extraction lane width</strong></td><td><span class="chip warn">medium</span></td><td><code>PROCESS_CONCURRENCY=1</code> was justified in comments with "extraction serialises inside Ollama anyway (measured)" — <em>and that measurement did not exist.</em> <code>bench:lane-width</code> now exists to decide it on the target hardware, alternating arm order so a drifting machine cannot fake a result. The default stays 1 until a clean number says otherwise.</td></tr>
         <tr><td><strong>Chunk size / MMR λ / seedK / expandHops</strong></td><td><span class="chip info">medium</span></td><td>Reasoned about, never swept — despite the harness supporting it trivially. Invariant 23 applied unevenly.</td></tr>
         <tr><td><strong>Cold-start</strong></td><td><span class="chip info">low</span></td><td>All figures are on a warm cache.</td></tr>
       </tbody>
@@ -8341,7 +9203,7 @@ process.<span class="f">on</span>(<span class="s">'SIGINT'</span>,  () =&gt; <sp
   <h4 class="sub4">R6 · "The graph has duplicate entities"</h4>
   <div class="ladder">
     <div class="step"><div class="n">1</div><div class="b">Look for the log line <em>"domain X has at least 2000 nodes; entity resolution only compares against the most recent"</em>. That is the candidate-window cap (ch. 13) and it is the most likely cause at any real corpus size.</div></div>
-    <div class="step"><div class="n">2</div><div class="b">Raise <code>RESOLUTION_CANDIDATE_LIMIT</code> as a stopgap. The real fix is ANN blocking (ch. 13) — the index already exists.</div></div>
+    <div class="step"><div class="n">2</div><div class="b"><span class="chip ok">done</span> Resolution reads the index (ch. 13). If duplicates still appear, they are <em>false splits</em> from the merge guard, not window misses — check the <code>[resolve] keeping "…" and "…" apart</code> logs, which state the reason for every refusal.</div></div>
     <div class="step"><div class="n">3</div><div class="b">If duplicates are near-synonyms rather than exact repeats, <code>SIM_THRESHOLD = 0.82</code> may be too high. <strong>Sweep it against <code>gold.ts</code>'s <code>ResolutionCase</code>s</strong> (aliases must merge, distractors must not) before changing it — and remember over-merging is irreversible where fragmenting is not.</div></div>
     <div class="step"><div class="n">4</div><div class="b">If an <em>edge</em> attached to the wrong node, suspect <code>findEntityId</code>'s substring fallback (ch. 15) — <code>"GS"</code> matching <code>"3D Gaussian Splatting"</code>.</div></div>
   </div>
@@ -8408,7 +9270,7 @@ process.<span class="f">on</span>(<span class="s">'SIGINT'</span>,  () =&gt; <sp
       <thead><tr><th style="width:210px">Breaks</th><th>Fix</th><th style="width:100px">Effort</th></tr></thead>
       <tbody>
         <tr><td><strong>Retrieval latency drifts</strong> — 153 ms p50 / 193 ms p95, up from 69/102 at 50k</td><td>Storage-side, not algorithmic: the working set stayed flat (ch. 28). Raise <code>shared_buffers</code> to hold the indexes; consider <code>halfvec</code>.</td><td>hours</td></tr>
-        <tr><td><strong>Entity resolution starts duplicating</strong></td><td>The 2,000-node candidate window (ch. 13). Raise <code>RESOLUTION_CANDIDATE_LIMIT</code> as a stopgap; move to <strong>ANN blocking</strong> as the fix — the index already exists.</td><td>1–2 days</td></tr>
+        <tr><td><strong>Entity resolution starts duplicating</strong></td><td><span class="chip ok">window removed</span> Candidates come from the index, so this is no longer a scale limit (ch. 13). Duplicates now mean either a <em>false split</em> from the merge guard — every refusal logs its reason — or a corpus split across domains, which looks identical (ch. 17b). Check <code>select domain, count(*) from papers group by 1</code> first.</td><td>hours</td></tr>
         <tr><td><strong>A batch runs for a day</strong></td><td><span class="chip ok">already solved</span> — the durable queue survives restarts and retries interrupted work (ch. 16). This is what stage 2 would otherwise have forced.</td><td>—</td></tr>
         <tr><td><strong>Deploys interrupt work</strong></td><td>Graceful shutdown (ch. 61). Thirty lines; the queue makes it cheap.</td><td>hours</td></tr>
         <tr><td><strong>Audit log grows unbounded</strong></td><td>Partition by month + a drop schedule. <strong>And fix the cross-tenant read</strong> (ch. 35 A10) before tenant two exists.</td><td>1 day</td></tr>
@@ -9545,7 +10407,11 @@ process.<span class="f">on</span>(<span class="s">'SIGINT'</span>,  () =&gt; <sp
         <tr><td class="mono">JOB_POLL_MS</td><td class="mono">1000</td><td>Claim poll interval, plus random jitter so instances do not synchronise.</td></tr>
         <tr><td class="mono">ARXIV_MIN_INTERVAL_MS</td><td class="mono">3000</td><td>Minimum gap between requests to arXiv, as their guidelines ask.</td></tr>
         <tr><td class="mono">ARXIV_USER_AGENT</td><td class="mono">Manifold/1.0 …</td><td>arXiv throttles anonymous callers far more aggressively.</td></tr>
-        <tr><td class="mono">RESOLUTION_CANDIDATE_LIMIT</td><td class="mono">2000</td><td>In-domain nodes entity resolution compares against. <strong>Logs when it hits the cap</strong> — that log line means older entities may be duplicating.</td></tr>
+        <tr><td class="mono">RESOLUTION_CANDIDATE_LIMIT</td><td class="mono">2000</td><td><strong>Legacy pipeline only.</strong> Nodes shown to the LLM resolver, bounded by prompt size. The field pipeline reads the index and has no window (ch. 13).</td></tr>
+        <tr><td class="mono">RESOLUTION_MERGE</td><td class="mono">guarded</td><td><code>exact</code> = only identical names merge (zero false merges). <code>guarded</code> = embedding matches must pass <code>merge-guard.ts</code>. <code>vector</code> = cosine alone — <strong>audited unsafe</strong>: two distinct papers score 0.87.</td></tr>
+        <tr><td class="mono">RESOLUTION_ANN_K</td><td class="mono">8</td><td>Neighbours fetched per mention from the HNSW index. More than the resolver consumes, to absorb HNSW's approximate recall — a duplicated entity is permanent damage where a slightly wider read is not.</td></tr>
+        <tr><td class="mono">MAX_JOB_CLAIMS</td><td class="mono">25</td><td>Total claims before a job is treated as a poison pill. Distinct from <code>MAX_JOB_ATTEMPTS</code>, which counts <em>handler failures</em> — conflating them let a deploy spend the retry budget (ch. 16).</td></tr>
+        <tr><td class="mono">SHUTDOWN_GRACE_MS</td><td class="mono">10000</td><td>How long SIGTERM waits for in-flight jobs before leaving them to lease recovery. Short by design: extraction takes ~15 min and no supervisor waits that long before SIGKILL.</td></tr>
         <tr><td class="mono">LLM_UNAVAILABLE_ABORT_AFTER</td><td class="mono">3</td><td>Consecutive unreachable-model chunk failures before abandoning a paper. Small but not 1: a blip is not an outage.</td></tr>
       </tbody>
     </table>

@@ -26,6 +26,9 @@ export type ProcessingStatus =
   | 'extracting_entities'
   | 'resolving_entities'
   | 'validating'
+  // Parked by an operator between chunks. Not a failure: the per-chunk
+  // checkpoint is intact, so resuming redoes nothing that already succeeded.
+  | 'paused'
   | 'completed'
   | 'failed';
 
